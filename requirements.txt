@@ -1,0 +1,4 @@
+matplotlib==3.10.7
+numpy==2.3.4
+openmc==0.15.2
+pandas==2.3.3
