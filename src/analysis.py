@@ -5,7 +5,9 @@ from matplotlib.axes import Axes
 from pathlib import Path
 import numpy as np
 import json
-from typing import Optional, List, Tuple, Union, Dict
+from typing import Optional, List, Tuple, Union, Dict, Literal
+
+from .materials import NIFMaterials
 
 # Set plotting params
 plt.rcParams['font.size'] = 20
@@ -59,10 +61,15 @@ class DataProcessor:
             print("Geometry not found in model.xml")
             return None
     
-    def extract_mesh_data(self) -> Tuple[pd.DataFrame, openmc.RegularMesh]:
+    def extract_mesh_data(self):
         """Extract mesh tally data"""
         tally = self.sp.get_tally(name='mesh_tally')
         mesh_tally_df = tally.get_pandas_dataframe()
+        
+        # Initialize new columns
+        mesh_tally_df['x'] = None
+        mesh_tally_df['y'] = None
+        mesh_tally_df['z'] = None
         
         # Extract coordinates
         mesh_tally_df['x'] = mesh_tally_df[('mesh 1', 'x')]
@@ -85,7 +92,8 @@ class DataProcessor:
         mesh_tally_df['mean'] /= voxel_volume
         mesh_tally_df['std. dev.'] /= voxel_volume
         
-        return mesh_tally_df, mesh_filter.mesh
+        self.mesh_tally_df = mesh_tally_df
+        self.mesh = mesh_filter.mesh
         
     def extract_fuel_data(self) -> pd.DataFrame:
         tally = self.sp.get_tally(name='fuel_tally')
@@ -185,79 +193,152 @@ class ResultsPlotter:
             self.save_dir = Path(save_dir)
         if not self.save_dir.exists():
             self.save_dir.mkdir(parents=True, exist_ok=True)
+            
+    def plot_mesh(
+        self,
+        score: str,
+        corner: Literal['top_left', 'top_right', 'bottom_left', 'bottom_right'] = 'top_right'
+    ):
+        # Generate mesh data if not done already
+        if not hasattr(self.data_processor, 'mesh'):
+            self.data_processor.extract_mesh_data()
+            
+        fig, ax = plt.subplots(figsize=(6, 6), layout='constrained')
+        self._plot_mesh_quadrant(fig, ax, score, corner)
+        self._plot_geometry(ax)
+        
+        plt.savefig(self.save_dir / f'{score}_mesh.png')
+        plt.close()
+        
+    def plot_combined_mesh(
+        self,
+        scores: List[str],
+    ):
+        if len(scores) > 4:
+            raise ValueError('Cannot plot more than 4 scores at once since they are divided into quadrants')
+        
+        # Generate mesh data if not done already
+        if not hasattr(self.data_processor, 'mesh'):
+            self.data_processor.extract_mesh_data()
+        
+        fig, ax = plt.subplots(figsize=(14, 10), layout='constrained')
+        corners = ['top_left', 'top_right', 'bottom_left', 'bottom_right']
+        cmaps = ['magma', 'plasma', 'viridis', 'hot']
+        for i, (score, cmap) in enumerate(zip(scores, cmaps)):
+            self._plot_mesh_quadrant(fig, ax, score, corner=corners[i], cmap=cmap)
+        self._plot_geometry(ax)
+        
+        plt.savefig(self.save_dir / f'combined_mesh.png')
+        plt.close()
+            
+    def _plot_geometry(
+        self,
+        ax: plt.Axes
+    ):
+        # Plot geometry underlay
+        geometry = self.data_processor.geometry
+        bounding_box = geometry.bounding_box
+        origin = (
+            (bounding_box.lower_left[0] + bounding_box.upper_right[0]) / 2,
+            0,
+            (bounding_box.lower_left[2] + bounding_box.upper_right[2]) / 2,
+        )
+        width = (
+            (bounding_box.upper_right[0] - bounding_box.lower_left[0]),
+            (bounding_box.upper_right[2] - bounding_box.lower_left[2]),
+        )
+        
+        # Actually plot geometry
+        pixels = 1000
+        geometry.plot(
+            axes=ax,
+            origin=origin,
+            width=width,
+            pixels=tuple([int(size * pixels / max(width)) for size in width]),
+            basis='xz',
+            color_by='material',
+            colors=NIFMaterials().get_colors(),
+            zorder=-1
+        )
+        
+        ax.set_xlabel('x (cm)')
+        ax.set_ylabel('z (cm)')
+        ax.set_aspect('equal')
     
-    def plot_mesh(self, scores: List[str]):
+    def _plot_mesh_quadrant(
+        self,
+        fig: plt.Figure,
+        ax: plt.Axes,
+        score: str,
+        corner: Literal['top_left', 'top_right', 'bottom_left', 'bottom_right'] = 'top_right',
+        cmap: Literal['magma', 'plasma', 'viridis', 'hot'] = 'magma'
+    ):
         """Create 2D spatial plots"""
-        mesh_df, mesh = self.data_processor.extract_mesh_data()
+        mesh_df = self.data_processor.mesh_tally_df
+        mesh = self.data_processor.mesh
+        
+        # Get score
+        possible_scores = mesh_df['score'].unique()
+        if score not in possible_scores:
+            raise ValueError(f'{score} not in available scores: {possible_scores}')
+        
+        score_df = mesh_df[mesh_df['score'] == score]
+        
         if mesh.dimension:
-            dim1, dim2 = mesh.dimension[0], mesh.dimension[2]
+            dim_x, dim_z = mesh.dimension[0], mesh.dimension[2]
         else:
             raise ValueError("Mesh dimensions not found")
         
-        possible_scores = mesh_df['score'].unique()
+        # Define the quadrants of the mesh
+        mid_x = (mesh.lower_left[0] + mesh.upper_right[0]) / 2
+        mid_z = (mesh.lower_left[2] + mesh.upper_right[2]) / 2
         
-        # Loop over scores to plot
-        for score in scores:
-            if score not in possible_scores:
-                raise ValueError(f'{score} not in available scores: {possible_scores}')
-            print(f'Plotting {score} mesh')
-            score_df = mesh_df[mesh_df['score'] == score]
-            score_df_agg = self.data_processor.get_aggregate(score_df, ['x', 'y', 'z'])
-            score_mean = score_df_agg['mean'].to_numpy().reshape((dim2, dim1), order='F')
-            
-            # Create plot for specified reaction
-            fig, ax = plt.subplots(figsize=(6, 6))
-            im = ax.imshow(
-                np.log10(score_mean),
-                cmap='magma',
-                origin='lower',
-                extent=(mesh.lower_left[0], mesh.upper_right[0], mesh.lower_left[2], mesh.upper_right[2]),
-            )
-            cbar = fig.colorbar(im, orientation='horizontal')
-            
-            # Plot gray, transparent overlay
-            geometry = self.data_processor.geometry
-            bounding_box = geometry.bounding_box
-            origin = (
-                (bounding_box.lower_left[0] + bounding_box.upper_right[0]) / 2,
-                0,
-                (bounding_box.lower_left[2] + bounding_box.upper_right[2]) / 2,
-            )
-            width = (
-                (bounding_box.upper_right[0] - bounding_box.lower_left[0]),
-                (bounding_box.upper_right[2] - bounding_box.lower_left[2]),
-            )
-            # Set cell colors
-            cell_colors = {}
-            for cell in geometry.get_all_cells().values():
-                if cell.fill == None:
-                    cell_colors[cell] = (255, 255, 255)
-                else:
-                    cell_colors[cell] = (0, 0, 0)
-
-            # Actually plot geometry
-            pixels = 1000
-            geometry.plot(
-                axes=ax,
-                origin=origin,
-                width=width,
-                pixels=tuple([int(size * pixels / max(width)) for size in width]),
-                basis='xz',
-                color_by='cell',
-                colors=cell_colors,
-                alpha=0.2
-            )
-            
-            ax.set_xlabel('x (cm)')
-            ax.set_ylabel('z (cm)')
-            ax.set_aspect('equal')
-            if score == 'flux':
-                label = f'log$_{{10}}$(neutrons/cm$^2$-source)'
-            else:
-                label = f'log$_{{10}}$({score}/cm$^3$-source)'
-            cbar.set_label(label)
-            fig.tight_layout()
-            fig.savefig(f'{self.save_dir}/{score}_mesh.png', bbox_inches='tight', pad_inches=0.05, dpi=300)
+        # Find dimensions depending on corner
+        if corner == 'top_left':
+            quadrant_df = score_df[(score_df['x'] <= dim_x//2) & (score_df['z'] > dim_z//2)]
+            extent = (mesh.lower_left[0], mid_x, mid_z, mesh.upper_right[2])
+        elif corner == 'top_right':
+            quadrant_df = score_df[(score_df['x'] > dim_x//2) & (score_df['z'] > dim_z//2)]
+            extent = (mid_x, mesh.upper_right[0], mid_z, mesh.upper_right[2])
+        elif corner == 'bottom_left':
+            quadrant_df = score_df[(score_df['x'] <= dim_x//2) & (score_df['z'] <= dim_z//2)]
+            extent = (mesh.lower_left[0], mid_x, mesh.lower_left[2], mid_z)
+        elif corner == 'bottom_right':
+            quadrant_df = score_df[(score_df['x'] > dim_x//2) & (score_df['z'] <= dim_z//2)]
+            extent = (mid_x, mesh.upper_right[0], mesh.lower_left[2], mid_z)
+        else:
+            raise ValueError(f'Corner {corner} not recognized')
+        
+        print(f'Plotting {score} mesh')
+        score_df_agg = self.data_processor.get_aggregate(quadrant_df, ['x', 'y', 'z'])
+        # Reshape into quadrant size
+        score_mean = score_df_agg['mean'].to_numpy().reshape((dim_x//2, dim_z//2), order='F')
+        
+        # Create plot for specified reaction
+        im = ax.imshow(
+            np.log10(score_mean),
+            cmap=cmap,
+            origin='lower',
+            extent=extent,
+        )
+        cbar_location = 'right' if corner in ['top_right', 'bottom_right'] else 'left'
+        cbar = fig.colorbar(im, orientation='vertical', location=cbar_location)
+        if score == 'flux':
+            label = f'log$_{{10}}$(neutrons/cm$^2$-source)'
+        else:
+            label = f'log$_{{10}}$({score}/cm$^3$-source)'
+        cbar.set_label(label)
+        
+        # Add text label of score on top of quadrant
+        ax.text(
+            (extent[0] + extent[1])/2,
+            (extent[2] + extent[3])/2,
+            score,
+            ha='center',
+            va='center',
+            color='white',
+            fontsize=30
+        )
     
     def plot_spectrum(
         self,
@@ -418,4 +499,9 @@ class ResultsPlotter:
         self.plot_spectrum(trace_tally_df, 'time', 'trace')
         
         # Plot 2D spatial maps
-        self.plot_mesh(['flux', 'scatter', '(n,2n)', '(n,3n)', '(n,gamma)'])
+        self.plot_mesh('flux')
+        self.plot_mesh('scatter')
+        self.plot_mesh('(n,2n)')
+        self.plot_mesh('(n,3n)')
+        self.plot_mesh('(n,gamma)')
+        self.plot_combined_mesh(['flux', 'scatter', '(n,2n)'])
