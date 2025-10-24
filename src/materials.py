@@ -296,3 +296,10 @@ class NIFMaterials(openmc.Materials):
             return material.get_mass_density()
         else:
             raise ValueError(f"Material '{name}' does not have density set.")
+        
+    def get_colors(self) -> dict:
+        """Get a color definition dict with material names as keys and colors as values."""
+        colors = {}
+        for material in self.library.values():
+            colors[material] = material.color
+        return colors
