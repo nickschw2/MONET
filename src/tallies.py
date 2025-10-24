@@ -1,6 +1,7 @@
 import openmc
 import numpy as np
 from typing import List, Optional
+from .geometry import DualSourceUniverse, DualFilledHohlraum
 
 class NIFTallies(openmc.Tallies):
     """Class to handle all tally definitions for NIF simulations"""
@@ -80,9 +81,15 @@ class NIFTallies(openmc.Tallies):
             self.append(trace_tally)
         
         # Neutron energy spectrum in fuel
-        fuel_cells = [cell for cell in self.geometry.get_all_cells().values() if 'fuel' in cell.name.lower()]
-        if fuel_cells:
-            fuel_filter = openmc.CellFilter(fuel_cells)
+        if isinstance(self.geometry.root_universe, (DualSourceUniverse, DualFilledHohlraum)):
+            # If it's a dual source universe, get secondary fuel
+            fuel_cell = self.geometry.get_cells_by_name('fuel_secondary')
+        else:
+            # Else get the primary fuel
+            fuel_cell = self.geometry.get_cells_by_name('fuel')
+            
+        if fuel_cell:
+            fuel_filter = openmc.CellFilter(fuel_cell)
             
             # Total neutron flux in fuel by energy
             fuel_tally = openmc.Tally(name='fuel_tally')
@@ -97,7 +104,11 @@ class NIFTallies(openmc.Tallies):
             # Create mesh
             mesh = openmc.RegularMesh()
             thickness = 0.1
-            mesh.lower_left = np.array([0, -thickness/2, 0])
+            mesh.lower_left = np.array([
+                self.geometry.bounding_box.lower_left[0],
+                -thickness/2,
+                self.geometry.bounding_box.lower_left[2]
+            ])
             mesh.upper_right = np.array([
                 self.geometry.bounding_box.upper_right[0],
                 thickness/2,
