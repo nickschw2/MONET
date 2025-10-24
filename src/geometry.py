@@ -678,7 +678,7 @@ class DualSourceUniverse(NIFUniverse):
         secondary_geom_cell.rotation = (180, 0, 0)
         secondary_geom_cell.translation = (0, 0, self.secondary_translation)
         
-        moderator_cell = openmc.Cell(
+        self.moderator_cell = openmc.Cell(
             name='moderator_cell',
             fill=self.materials[self.moderator_material],
             region=moderator_region
@@ -690,7 +690,7 @@ class DualSourceUniverse(NIFUniverse):
             region=vacuum_region
         )
         
-        self.add_cells([primary_geom_cell, secondary_geom_cell, moderator_cell, vacuum_cell])
+        self.add_cells([primary_geom_cell, secondary_geom_cell, self.moderator_cell, vacuum_cell])
         
     def get_outer_region(self) -> openmc.Region:
         return self.outer_region
@@ -713,6 +713,9 @@ class DualFilledHohlraum(DualSourceUniverse):
         hohlraum_material: str = 'gold',
         fill_material: str = 'ch2',
         hohlraum_wall_thickness: float = 0.03,
+        multiplier_material: Optional[str] = None,
+        multiplier_thickness: Optional[float] = None,
+        multiplier_primary_gap: Optional[float] = None,
         hohlraum_lining_thickness: Optional[float] = None,
         hohlraum_lining_material: Optional[str] = None,
         **kwargs
@@ -736,12 +739,18 @@ class DualFilledHohlraum(DualSourceUniverse):
             Name of hohlraum fill material
         hohlraum_wall_thickness : float
             Wall thickness of hohlraum in cm
+        multiplier_material: str, optional
+            Name of neutron multiplier material
+        multiplier_thickness: float, optional
+            Thickness of neutron multiplier layer
+        multiplier_primary_gap: float, optional
+            Gap between the edge of the primary source and the start of the multiplier layer
         hohlraum_lining_thickness : float, optional
             Wall thickness of hohlraum lining in cm
         hohlraum_lining_material : str, optional
             Name of hohlraum lining material
         **kwargs
-            Additional parameters passed to NIFUniverse
+            Additional parameters passed to DualSourceUniverse
         """
         
         # Store hohlraum-specific parameters
@@ -750,18 +759,26 @@ class DualFilledHohlraum(DualSourceUniverse):
         self.hohlraum_inner_radius = hohlraum_inner_radius
         self.hohlraum_material = hohlraum_material
         self.hohlraum_wall_thickness = hohlraum_wall_thickness
+        self.multiplier_material = multiplier_material
+        self.multiplier_thickness = multiplier_thickness
+        self.multiplier_primary_gap = multiplier_primary_gap
         self.hohlraum_lining_thickness = hohlraum_lining_thickness
         self.hohlraum_lining_material = hohlraum_lining_material
                 
         # Calculate center distance based on source size and gap
-        primary_radius = primary_coronal.capsule_radius_original
+        self.primary_radius = primary_coronal.capsule_radius_original
         secondary_radius = secondary_coronal.capsule_radius_original
-        center_distance = primary_radius + secondary_radius + source_gap
+        center_distance = self.primary_radius + secondary_radius + source_gap
         
         # Calculate moderator thickness based on distance between flats of LEH
-        primary_LEH_z = np.sqrt(primary_radius**2 - primary_coronal.hole_radius_original**2)
+        primary_LEH_z = np.sqrt(self.primary_radius**2 - primary_coronal.hole_radius_original**2)
         secondary_LEH_z = np.sqrt(secondary_radius**2 - secondary_coronal.hole_radius_original**2)
         moderator_thickness = primary_LEH_z + secondary_LEH_z + center_distance
+        
+        # Check to make sure that the moderator does not intersect the secondary source
+        if self.multiplier_primary_gap and self.multiplier_thickness:
+            if self.multiplier_primary_gap + self.multiplier_thickness > source_gap:
+                raise ValueError('The multiplier is intersecting the secondary source.')
         
         # Initialize parent class
         # We'll override _create_geometry to build our specialized version
@@ -851,6 +868,22 @@ class DualFilledHohlraum(DualSourceUniverse):
             
             # Redefine outer region
             self.outer_region = -hohlraum_lining_outer_cylinder & +hohlraum_lining_bottom & -hohlraum_lining_top
+            
+        if self.multiplier_material and self.multiplier_thickness and self.multiplier_primary_gap:
+            multiplier_bottom_plane = openmc.ZPlane(self.primary_translation + self.primary_radius + self.multiplier_primary_gap)
+            multiplier_top_plane = openmc.ZPlane(self.primary_translation + self.primary_radius + self.multiplier_primary_gap + self.multiplier_thickness)
+            
+            multiplier_region = -self.moderator_rcc.cyl & +multiplier_bottom_plane & -multiplier_top_plane
+            multiplier_cell = openmc.Cell(
+                name='multiplier_layer',
+                region=multiplier_region,
+                fill=self.materials[self.multiplier_material]
+            )
+            self.add_cell(multiplier_cell)
+            
+            # Exclude multiplier from other regions
+            self.moderator_cell.region &= ~multiplier_region
+            hohlraum_cell.region &= ~multiplier_region
             
         # Create vacuum cell
         vacuum_rcc = RCC(
