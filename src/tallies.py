@@ -1,6 +1,7 @@
 import openmc
 import numpy as np
 from typing import List, Optional
+
 from .geometry import DualSourceUniverse, DualFilledHohlraum
 
 class NIFTallies(openmc.Tallies):
@@ -81,12 +82,13 @@ class NIFTallies(openmc.Tallies):
             self.append(trace_tally)
         
         # Neutron energy spectrum in fuel
-        if isinstance(self.geometry.root_universe, (DualSourceUniverse, DualFilledHohlraum)):
+        fuel_cells = self.geometry.get_cells_by_name('fuel')
+        if len(fuel_cells) > 1:
             # If it's a dual source universe, get secondary fuel
-            fuel_cell = self.geometry.get_cells_by_name('fuel_secondary')
+            fuel_cell = self.geometry.get_cells_by_name('fuel_secondary')[0]
         else:
             # Else get the primary fuel
-            fuel_cell = self.geometry.get_cells_by_name('fuel')
+            fuel_cell = fuel_cells[0]
             
         if fuel_cell:
             fuel_filter = openmc.CellFilter(fuel_cell)

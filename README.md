@@ -1,6 +1,6 @@
-# MOderated NEutron Transport (MONET)
+# MOderated NEutron Target (MONET)
 
-This simulation suite is designed to investigate neutron moderation strategies for producing low-energy neutrons (<1 MeV) that can react with <sup>171</sup>Tm through radiative capture at the National Ignition Facility (NIF).
+This simulation suite is designed to investigate neutron moderation target strategies for producing low-energy neutrons (<1 MeV) that can react with <sup>171</sup>Tm through radiative capture at the National Ignition Facility (NIF).
 
 ## Overview
 

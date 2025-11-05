@@ -215,6 +215,13 @@ class NIFMaterials(openmc.Materials):
             elements=['C'],
             fractions=[1], 
             density=2.2,
+        ),
+        "lead": NIFMaterial(
+            name='lead', 
+            color='lightgray',
+            elements=['Pb'],
+            fractions=[1], 
+            density=11.35,
         )
     }
 

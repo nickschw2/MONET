@@ -8,6 +8,7 @@ import json
 from typing import Optional, List, Tuple, Union, Dict, Literal
 
 from .materials import NIFMaterials
+from .geometry import DualSourceUniverse, DualFilledHohlraum
 
 # Set plotting params
 plt.rcParams['font.size'] = 20
@@ -31,16 +32,6 @@ class DataProcessor:
         else:
             raise FileNotFoundError(f"No simulation_params.json file found in {simulation_dir}")
         
-        # Load model.xml to get geometry
-        model_file = self.simulation_dir / 'model.xml'
-        geometry_file = self.simulation_dir / 'geometry.xml'
-        materials_file = self.simulation_dir / 'materials.xml'
-        if geometry_file.exists() and materials_file.exists():
-            self.geometry = openmc.Geometry.from_xml(geometry_file, materials_file)
-            # self.geometry = model.geometry
-        else:
-            raise FileNotFoundError(f"No geometry.xml or materials.xml file found in {simulation_dir}")
-        
         # Open the statepoint file
         statepoint_file = self.simulation_dir / f'statepoint.{batches}.h5'
         
@@ -49,17 +40,29 @@ class DataProcessor:
         else:
             raise FileNotFoundError(f"No statepoint file found in {simulation_dir}")
         
-    def get_fuel_cell(self) -> openmc.Cell | None:
+        # Load model.xml to get geometry
+        model_file = self.simulation_dir / 'model.xml'
+        geometry_file = self.simulation_dir / 'geometry.xml'
+        materials_file = self.simulation_dir / 'materials.xml'
+        
+        if geometry_file.exists() and materials_file.exists():
+            self.geometry = openmc.Geometry.from_xml(geometry_file, materials_file)
+            # self.geometry = model.geometry
+        else:
+            raise FileNotFoundError(f"No geometry.xml or materials.xml file found in {simulation_dir}")
+        
+    def get_fuel_cell(self) -> openmc.Cell:
         """Get fuel cell object from model"""
         if self.geometry:
-            for cell in self.geometry.get_all_cells().values():
-                if 'fuel' in cell.name.lower():
-                    return cell
-            print("Fuel cell not found in geometry")
-            return None
+            fuel_cells = self.geometry.get_cells_by_name('fuel')
+            if len(fuel_cells) > 1:
+                # If it's a dual source universe, get secondary fuel
+                return self.geometry.get_cells_by_name('fuel_secondary')[0]
+            else:
+                # Else get the primary fuel
+                return fuel_cells[0]
         else:
-            print("Geometry not found in model.xml")
-            return None
+            raise RuntimeError("Geometry not found")
     
     def extract_mesh_data(self):
         """Extract mesh tally data"""
@@ -99,13 +102,19 @@ class DataProcessor:
         tally = self.sp.get_tally(name='fuel_tally')
         fuel_tally_df = tally.get_pandas_dataframe()
         
-        # Get fuel cell volume
+        # Get fuel cell and its volume
         fuel_cell = self.get_fuel_cell()
+        fuel_tally_df = fuel_tally_df[fuel_tally_df['cell'] == fuel_cell.id]
+        
+        # Check to make sure fuel cell was found
+        if len(fuel_tally_df) == 0:
+            raise Exception("No data found for fuel cell filter")
+        
         if fuel_cell is None:
             volume = 1.0  # cm^3
         else:
             volume = fuel_cell.volume if fuel_cell.volume else 1.0
-            
+        
         # Normalize by volume
         fuel_tally_df['mean'] /= volume
         fuel_tally_df['std. dev.'] /= volume

@@ -61,7 +61,7 @@ class NIFSimulation:
     
     def setup_simulation(
         self,
-        geometry_type: Literal['standard', 'double_shell', 'coronal', 'dual_source', 'dual_filled_hohlraum'] = 'standard',
+        geometry_type: Literal['standard', 'double_shell', 'coronal', 'dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal'] = 'standard',
         # Simulation parameters
         batches: int = 100,
         particles_per_batch: int = int(1e5),
@@ -79,7 +79,7 @@ class NIFSimulation:
         Parameters:
         -----------
         geometry_type : str
-            Geometry type, one of ['standard', 'double_shell', 'coronal', 'dual_source', 'dual_filled_hohlraum']
+            Geometry type, one of ['standard', 'double_shell', 'coronal', 'dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal']
         batches : int
             Number of batches
         particles_per_batch : int
@@ -126,7 +126,7 @@ class NIFSimulation:
         settings.output = {'tallies': True}
                 
         # Create geometry
-        if geometry_type == 'dual_source' or geometry_type == 'dual_filled_hohlraum':
+        if geometry_type == 'dual_source' or geometry_type == 'dual_filled_hohlraum' or geometry_type == 'dual_hohlraum_coronal':
             universe = self._setup_dual_source_geometry(geometry_type, materials, **geometry_kwargs or {})
             primary_fuel_radius, primary_fuel_cell = universe.primary_geom.get_fuel_params()
             secondary_fuel_radius, secondary_fuel_cell = universe.secondary_geom.get_fuel_params()
@@ -137,7 +137,7 @@ class NIFSimulation:
             # TODO: assume the two sources have the same pulse width and start time, change this to be configurable
             # TODO: assuming that the fuel is the same in both sources, change this to be configurable
             # Create source
-            primary_origin = (0, 0, universe.primary_translation)
+            primary_origin = tuple(universe.axis_vector * universe.primary_translation)
             primary_source = SphericalSource(
                 fuel_radius=primary_fuel_radius_compressed,
                 constraints={'domains': [primary_fuel_cell]},
@@ -150,7 +150,7 @@ class NIFSimulation:
             plasma_temperature = primary_source.plasma_temperature
             
             # Place secondary source in correct location
-            secondary_origin = (0, 0, universe.secondary_translation)
+            secondary_origin = tuple(universe.axis_vector * universe.secondary_translation)
             secondary_source = SphericalSource(
                 fuel_radius=secondary_fuel_radius_compressed,
                 constraints={'domains': [secondary_fuel_cell]},
@@ -160,7 +160,8 @@ class NIFSimulation:
             )
             
             # Set source in settings
-            settings.source = [primary_source, secondary_source]
+            settings.source = [primary_source]
+            # settings.source = [primary_source, secondary_source]
         else:
             universe = self._setup_geometry(geometry_type, materials, **geometry_kwargs or {})
 
@@ -314,7 +315,7 @@ class NIFSimulation:
         
     def _setup_dual_source_geometry(
         self,
-        type: Literal['dual_source', 'dual_filled_hohlraum'],
+        type: Literal['dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal'],
         materials: NIFMaterials,
         primary_geometry_type: Literal['standard', 'double_shell', 'coronal'],
         secondary_geometry_type: Literal['standard', 'double_shell', 'coronal'],
@@ -327,7 +328,7 @@ class NIFSimulation:
         
         Parameters:
         type : str
-            Geometry type, one of ['dual_source', 'dual_filled_hohlraum']
+            Geometry type, one of ['dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal']
         materials : NIFMaterials
             Material database
         primary_geometry_type : str
@@ -364,7 +365,7 @@ class NIFSimulation:
                 secondary_geom=secondary_geom,
                 **kwargs or {}
             )
-        else:
+        elif type == 'dual_filled_hohlraum':
             if not isinstance(primary_geom, CoronalUniverse) or not isinstance(secondary_geom, CoronalUniverse):
                 raise ValueError("Both primary and secondary geometries must be 'coronal' for 'dual_filled_hohlraum' type")
             
@@ -374,6 +375,18 @@ class NIFSimulation:
                 materials=materials,
                 **kwargs or {}
             )
+        elif type == 'dual_hohlraum_coronal':
+            if not isinstance(primary_geom, StandardNIFUniverse) or not isinstance(secondary_geom, CoronalUniverse):
+                raise ValueError("Both primary and secondary geometries must be 'coronal' for 'dual_hohlraum_coronal' type")
+            
+            universe = DualHohlraumCoronal(
+                primary_hohlraum=primary_geom,
+                secondary_coronal=secondary_geom,
+                materials=materials,
+                **kwargs or {}
+            )
+        else:
+            raise ValueError(f"Invalid geometry type: {type}")
         
         return universe
     
