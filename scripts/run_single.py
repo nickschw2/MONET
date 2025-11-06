@@ -16,9 +16,9 @@ if __name__ == "__main__":
         # 'moderator_thickness': [0.3,0.3, 0.3],
         # 'moderator_material': ['tungsten', 'beryllium', 'ch2'],
         # 'secondary_orientation': 'perpendicular',
-        'multiplier_material': 'beryllium',
-        'multiplier_thickness': 0.3,
-        'multiplier_primary_gap': 0.1,
+        'layered_moderator_material': ['tungsten', 'beryllium', 'lead'],
+        'layered_moderator_thickness': [0.1, 0.1, 0.1],
+        'layered_moderator_primary_gap': 0.1,
         # 'source_gap': 1.0,
         # 'hohlraum_wall_thickness': 0.07
     }
