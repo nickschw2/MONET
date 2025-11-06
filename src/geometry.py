@@ -2,7 +2,7 @@ import openmc
 from openmc.model import RectangularParallelepiped as BOX
 from openmc.model import RightCircularCylinder as RCC
 import numpy as np
-from typing import Optional, Literal, Tuple, Dict, Any
+from typing import Optional, Literal, Tuple, Union, Sequence
 from abc import abstractmethod
 from .materials import NIFMaterials
 
@@ -580,9 +580,9 @@ class DualSourceUniverse(NIFUniverse):
         primary_geom: NIFUniverse,
         secondary_geom: NIFUniverse,
         center_distance: float = 0.5,
-        moderator_thickness: float = 0.1,
         moderator_radius: float = 1.0,
-        moderator_material: str = 'ch2',
+        moderator_thickness: Union[float, Sequence[float]] = 0.1,
+        moderator_material: Union[str, Sequence[str]] = 'ch2',
         moderator_distance: Optional[float] = None,
         secondary_orientation: Literal['parallel', 'perpendicular'] = 'parallel',
         **kwargs
@@ -598,11 +598,11 @@ class DualSourceUniverse(NIFUniverse):
             Secondary source geometry
         center_distance : float
             Distance between source centers in cm
-        moderator_thickness : float
-            Moderator thickness in cm
         moderator_radius : float
             Moderator diameter in cm
-        moderator_material : str, optional
+        moderator_thickness : float, Sequence[float]
+            Moderator thickness in cm
+        moderator_material : str, Sequence[str]
             Moderator material name
         moderator_distance : float, optional
             Distance between moderator center and primary source center in cm
@@ -614,11 +614,21 @@ class DualSourceUniverse(NIFUniverse):
         self.primary_geom = primary_geom
         self.secondary_geom = secondary_geom
         self.center_distance = center_distance
-        self.moderator_thickness = moderator_thickness
         self.moderator_radius = moderator_radius
-        self.moderator_material = moderator_material
         self.moderator_distance = moderator_distance or center_distance / 2 # default to midway between sources
         self.secondary_orientation = secondary_orientation
+        
+        # Handle if moderator is iterable vs not
+        if isinstance(moderator_thickness, float) and isinstance(moderator_material, str):
+            self.moderator_thickness = [moderator_thickness]
+            self.moderator_material = [moderator_material]
+        elif isinstance(moderator_thickness, Sequence) and isinstance(moderator_material, Sequence) and not isinstance(moderator_material, str):
+            if len(moderator_thickness) != len(moderator_material):
+                raise ValueError("Moderator thickness and material must be the same length")
+            self.moderator_thickness = moderator_thickness
+            self.moderator_material = moderator_material
+        else:
+            raise ValueError("Moderator thickness and material must be the same type")
         
         if self.moderator_distance > center_distance:
             raise ValueError("Moderator distance must be less than center distance")
@@ -646,21 +656,15 @@ class DualSourceUniverse(NIFUniverse):
             axis_int = 2
             self.axis_vector = np.array([0, 0, 1])
             rotation = np.array([180, 0, 0])
+            self.moderator_cyl = openmc.ZCylinder(r=self.moderator_radius)
         elif self.secondary_orientation == 'perpendicular':
             axis = 'x'
             axis_int = 0
             self.axis_vector = np.array([1, 0, 0])
             rotation = np.array([0, -90, 0])
+            self.moderator_cyl = openmc.XCylinder(r=self.moderator_radius)
         else:
             raise ValueError("secondary_orientation must be one of ['parallel', 'perpendicular']")
-             
-        ### Surfaces ###
-        self.moderator_rcc = RCC(
-            center_base=-self.axis_vector * self.moderator_thickness / 2,
-            radius=self.moderator_radius,
-            height=self.moderator_thickness,
-            axis=axis
-        )
         
         # Translation of primary and secondary regions
         self.primary_translation = -self.moderator_distance
@@ -668,8 +672,10 @@ class DualSourceUniverse(NIFUniverse):
         
         # Use bounding boxes to find the extent of the geometry
         primary_min_pos = self.primary_geom.bounding_box.lower_left[axis_int] + self.primary_translation
+        primary_max_pos = self.primary_geom.bounding_box.upper_right[axis_int] + self.primary_translation
         # The secondary geometry is located at the top of the moderator
         secondary_max_pos = self.secondary_geom.bounding_box.upper_right[axis_int] + self.secondary_translation
+        secondary_min_pos = self.secondary_geom.bounding_box.lower_left[axis_int] + self.secondary_translation
         # Add a bit of padding to all sides
         vacuum_rcc = RCC(
             center_base=self.axis_vector * primary_min_pos * 1.1,
@@ -693,11 +699,44 @@ class DualSourceUniverse(NIFUniverse):
         transformed_primary_geom_region = primary_geom_region.translate(self.axis_vector * self.primary_translation)
         transformed_secondary_geom_region = transformed_secondary_geom_region.translate(self.axis_vector * self.secondary_translation)
         
-        # The primary and secondary source could interset the moderator region
-        moderator_region = -self.moderator_rcc & ~transformed_primary_geom_region & ~transformed_secondary_geom_region
-        vacuum_region = -vacuum_rcc & ~transformed_primary_geom_region & ~transformed_secondary_geom_region & + self.moderator_rcc
+        # Create moderator stack
+        total_thickness = np.sum(self.moderator_thickness)
+        # Create planes
+        self.moderator_planes = [
+            openmc.Plane(
+                *tuple(self.axis_vector),
+                -total_thickness / 2
+            )
+        ]
+        for i in range(len(self.moderator_thickness)):
+            self.moderator_planes.append(
+                openmc.Plane(
+                    *tuple(self.axis_vector),
+                    -total_thickness / 2 + np.sum(self.moderator_thickness[:i+1])
+                )
+            )
+            
+        # Create moderator cells
+        for i, material in enumerate(self.moderator_material):
+            moderator_region = -self.moderator_cyl & +self.moderator_planes[i] & -self.moderator_planes[i+1]
+            # Exclude the sources from the moderator if it overlaps
+            if primary_max_pos > self.moderator_planes[i].d:
+                moderator_region &= ~transformed_primary_geom_region
+            if secondary_min_pos < self.moderator_planes[i+1].d:
+                moderator_region &= ~transformed_secondary_geom_region
+            moderator_cell = openmc.Cell(
+                name=f'moderator_cell_{i}',
+                region=moderator_region,
+                fill=self.materials[material]
+            )
+            self.add_cell(moderator_cell)
+            
+        total_moderator_region = -self.moderator_cyl & +self.moderator_planes[0] & -self.moderator_planes[-1]
         
-        self.outer_region = transformed_primary_geom_region | transformed_secondary_geom_region | -self.moderator_rcc
+        # The primary and secondary source could interset the moderator region
+        vacuum_region = -vacuum_rcc & ~transformed_primary_geom_region & ~transformed_secondary_geom_region & ~total_moderator_region
+        
+        self.outer_region = transformed_primary_geom_region | transformed_secondary_geom_region | total_moderator_region
         
         ### Cells ###
         primary_geom_cell = openmc.Cell(
@@ -710,6 +749,7 @@ class DualSourceUniverse(NIFUniverse):
             primary_geom_cell.rotation = -rotation
         # Translate primary source cell into position
         primary_geom_cell.translation = self.axis_vector * self.primary_translation
+        self.add_cell(primary_geom_cell)
         
         secondary_geom_cell = openmc.Cell(
             name='secondary_geom_cell',
@@ -719,20 +759,14 @@ class DualSourceUniverse(NIFUniverse):
         # Rotate and translate secondary source cell into position
         secondary_geom_cell.rotation = rotation
         secondary_geom_cell.translation = self.axis_vector * self.secondary_translation
-        
-        self.moderator_cell = openmc.Cell(
-            name='moderator_cell',
-            fill=self.materials[self.moderator_material],
-            region=moderator_region
-        )
+        self.add_cell(secondary_geom_cell)
         
         vacuum_cell = openmc.Cell(
             name='vacuum_cell',
             fill=None,
             region=vacuum_region
         )
-        
-        self.add_cells([primary_geom_cell, secondary_geom_cell, self.moderator_cell, vacuum_cell])
+        self.add_cell(vacuum_cell)
         
     def get_outer_region(self) -> openmc.Region:
         return self.outer_region
@@ -755,8 +789,8 @@ class DualFilledHohlraum(DualSourceUniverse):
         hohlraum_material: str = 'tungsten',
         fill_material: str = 'ch2',
         hohlraum_wall_thickness: float = 0.03,
-        multiplier_material: Optional[str] = None,
-        multiplier_thickness: Optional[float] = None,
+        multiplier_material: Optional[Union[str, Sequence[str]]] = None,
+        multiplier_thickness: Optional[Union[float, Sequence[float]]] = None,
         multiplier_primary_gap: Optional[float] = None,
         hohlraum_lining_thickness: Optional[float] = None,
         hohlraum_lining_material: Optional[str] = None,
@@ -781,9 +815,9 @@ class DualFilledHohlraum(DualSourceUniverse):
             Name of hohlraum fill material
         hohlraum_wall_thickness : float
             Wall thickness of hohlraum in cm
-        multiplier_material: str, optional
+        multiplier_material: str | Sequence[str], optional
             Name of neutron multiplier material
-        multiplier_thickness: float, optional
+        multiplier_thickness: float | Sequence[float], optional
             Thickness of neutron multiplier layer
         multiplier_primary_gap: float, optional
             Gap between the edge of the primary source and the start of the multiplier layer
@@ -815,7 +849,7 @@ class DualFilledHohlraum(DualSourceUniverse):
         # Calculate moderator thickness based on distance between flats of LEH
         primary_LEH_z = np.sqrt(self.primary_radius**2 - primary_coronal.hole_radius_original**2)
         secondary_LEH_z = np.sqrt(secondary_radius**2 - secondary_coronal.hole_radius_original**2)
-        moderator_thickness = primary_LEH_z + secondary_LEH_z + center_distance
+        self.fill_length = primary_LEH_z + secondary_LEH_z + center_distance
         
         # Check to make sure that the moderator does not intersect the secondary source
         if self.multiplier_primary_gap and self.multiplier_thickness:
@@ -828,7 +862,7 @@ class DualFilledHohlraum(DualSourceUniverse):
             primary_geom=primary_coronal,
             secondary_geom=secondary_coronal,
             center_distance=center_distance,
-            moderator_thickness=moderator_thickness,
+            moderator_thickness=self.fill_length,
             moderator_radius=hohlraum_inner_radius,
             moderator_material=fill_material,
             convergence_ratio=1.0, # No compression
@@ -853,24 +887,24 @@ class DualFilledHohlraum(DualSourceUniverse):
         hohlraum_outer_cylinder = openmc.ZCylinder(r=self.hohlraum_inner_radius + self.hohlraum_wall_thickness)
         primary_LEH_cylinder = openmc.ZCylinder(r=self.primary_coronal.hole_radius_original)
         secondary_LEH_cylinder = openmc.ZCylinder(r=self.secondary_coronal.hole_radius_original)
-        hohlraum_bottom = openmc.ZPlane(z0=-(self.moderator_thickness/2 + self.hohlraum_wall_thickness))
-        hohlraum_top = openmc.ZPlane(z0=self.moderator_thickness/2 + self.hohlraum_wall_thickness)
-        moderator_bottom = self.moderator_rcc.top
-        moderator_top = self.moderator_rcc.bottom
+        hohlraum_bottom = openmc.ZPlane(z0=-(self.fill_length/2 + self.hohlraum_wall_thickness))
+        hohlraum_top = openmc.ZPlane(z0=self.fill_length/2 + self.hohlraum_wall_thickness)
+        moderator_bottom = self.moderator_planes[0]
+        moderator_top = self.moderator_planes[-1]
         
         # Vacuum is slightly larger than hohlraum to avoid overlap
-        vacuum_center_base = (0, 0, -(self.moderator_thickness/2 + self.hohlraum_wall_thickness) * 1.1)
+        vacuum_center_base = (0, 0, -(self.fill_length/2 + self.hohlraum_wall_thickness) * 1.1)
         vacuum_radius = (self.hohlraum_inner_radius + self.hohlraum_wall_thickness) * 1.1
-        vacuum_height = (self.moderator_thickness + 2 * self.hohlraum_wall_thickness) * 1.1
+        vacuum_height = (self.fill_length + 2 * self.hohlraum_wall_thickness) * 1.1
         
         # Define hohlraum region
         hohlraum_bottom_LEH_region = -hohlraum_outer_cylinder & +primary_LEH_cylinder & +hohlraum_bottom & -moderator_bottom
         hohlraum_top_LEH_region = -hohlraum_outer_cylinder & +secondary_LEH_cylinder & +moderator_top & -hohlraum_top
-        hohlraum_shell_region = -hohlraum_outer_cylinder & +self.moderator_rcc.cyl & +moderator_bottom & -moderator_top
-        hohlraum_region = hohlraum_bottom_LEH_region | hohlraum_top_LEH_region | hohlraum_shell_region
+        hohlraum_wall_region = -hohlraum_outer_cylinder & +self.moderator_cyl & +moderator_bottom & -moderator_top
+        hohlraum_region = hohlraum_bottom_LEH_region | hohlraum_top_LEH_region | hohlraum_wall_region
         
         # Define outer region
-        self.outer_region = hohlraum_region | -self.moderator_rcc
+        self.outer_region = hohlraum_region | (-self.moderator_cyl & +moderator_bottom & -moderator_top)
         
         # Create cells
         hohlraum_cell = openmc.Cell(
@@ -886,19 +920,19 @@ class DualFilledHohlraum(DualSourceUniverse):
             self.remove_vacuum_boundaries()
             
             hohlraum_lining_outer_cylinder = openmc.ZCylinder(r=self.hohlraum_inner_radius + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness)
-            hohlraum_lining_bottom = openmc.ZPlane(z0=-(self.moderator_thickness/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness))
-            hohlraum_lining_top = openmc.ZPlane(z0=self.moderator_thickness/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness)
+            hohlraum_lining_bottom = openmc.ZPlane(z0=-(self.fill_length/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness))
+            hohlraum_lining_top = openmc.ZPlane(z0=self.fill_length/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness)
             
             # Define lining region, excluding LEH regions
             hohlraum_lining_bottom_LEH_region = -hohlraum_lining_outer_cylinder & +primary_LEH_cylinder & +hohlraum_lining_bottom & -hohlraum_bottom
             hohlraum_lining_top_LEH_region = -hohlraum_lining_outer_cylinder & +secondary_LEH_cylinder & +hohlraum_top & -hohlraum_lining_top
-            hohlraum_lining_shell_region = -hohlraum_lining_outer_cylinder & +hohlraum_outer_cylinder & +hohlraum_lining_bottom & -hohlraum_lining_top
-            hohlraum_lining_region = hohlraum_lining_bottom_LEH_region | hohlraum_lining_top_LEH_region | hohlraum_lining_shell_region
+            hohlraum_lining_wall_region = -hohlraum_lining_outer_cylinder & +hohlraum_outer_cylinder & +hohlraum_lining_bottom & -hohlraum_lining_top
+            hohlraum_lining_region = hohlraum_lining_bottom_LEH_region | hohlraum_lining_top_LEH_region | hohlraum_lining_wall_region
             
             # Redefine vacuum region to exclude lining
-            vacuum_center_base = (0, 0, -(self.moderator_thickness/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness) * 1.1)
+            vacuum_center_base = (0, 0, -(self.fill_length/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness) * 1.1)
             vacuum_radius = (self.hohlraum_inner_radius + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness) * 1.1
-            vacuum_height = (self.moderator_thickness + 2 * (self.hohlraum_wall_thickness + self.hohlraum_lining_thickness)) * 1.1
+            vacuum_height = (self.fill_length + 2 * (self.hohlraum_wall_thickness + self.hohlraum_lining_thickness)) * 1.1
             
             # Create hohlraum lining cell
             hohlraum_lining_cell = openmc.Cell(
@@ -915,7 +949,7 @@ class DualFilledHohlraum(DualSourceUniverse):
             multiplier_bottom_plane = openmc.ZPlane(self.primary_translation + self.primary_radius + self.multiplier_primary_gap)
             multiplier_top_plane = openmc.ZPlane(self.primary_translation + self.primary_radius + self.multiplier_primary_gap + self.multiplier_thickness)
             
-            multiplier_region = -self.moderator_rcc.cyl & +multiplier_bottom_plane & -multiplier_top_plane
+            multiplier_region = -self.moderator_cyl & +multiplier_bottom_plane & -multiplier_top_plane
             multiplier_cell = openmc.Cell(
                 name='multiplier_layer',
                 region=multiplier_region,
@@ -924,7 +958,9 @@ class DualFilledHohlraum(DualSourceUniverse):
             self.add_cell(multiplier_cell)
             
             # Exclude multiplier from other regions
-            self.moderator_cell.region &= ~multiplier_region
+            for cell in self.cells.values():
+                if 'moderator' in cell.name:
+                    cell.region &= ~multiplier_region
             hohlraum_cell.region &= ~multiplier_region
             
         # Create vacuum cell
@@ -935,7 +971,7 @@ class DualFilledHohlraum(DualSourceUniverse):
             axis='z',
             boundary_type='vacuum'
         )
-        vacuum_region = -vacuum_rcc & ~hohlraum_region & +self.moderator_rcc
+        vacuum_region = -vacuum_rcc & ~hohlraum_region & ~(-self.moderator_cyl & +moderator_bottom & -moderator_top)
         vacuum_cell = openmc.Cell(
             name='vacuum_cell',
             region=vacuum_region
@@ -954,8 +990,8 @@ class DualHohlraumCoronal(DualSourceUniverse):
         self,
         primary_hohlraum: StandardNIFUniverse,
         secondary_coronal: CoronalUniverse,
-        moderator_material: str = 'ch2',
-        moderator_thickness: float = 0.6,
+        moderator_thickness: Union[float, Sequence[float]] = 0.6,
+        moderator_material: Union[str, Sequence[str]] = 'ch2',
         **kwargs
     ):
         """
@@ -967,20 +1003,22 @@ class DualHohlraumCoronal(DualSourceUniverse):
             Primary hohlraum source geometry
         secondary_coronal : CoronalUniverse
             Secondary coronal source geometry
-        moderator_material : str, optional
-            Moderator material name
-        moderator_thickness : float, optional
+        moderator_thickness : float, Sequence[float]
             Moderator thickness in cm
+        moderator_material : str, Sequence[str]
+            Moderator material name
         """
         self.primary_hohlraum = primary_hohlraum
         self.secondary_coronal = secondary_coronal
-        self.moderator_material = moderator_material
-        self.moderator_thickness = moderator_thickness
+        if isinstance(moderator_thickness, float):
+            total_thickness = moderator_thickness
+        else:
+            total_thickness = np.sum(moderator_thickness)
         
         # Calculate distances
         secondary_LEH_z = np.sqrt(secondary_coronal.capsule_radius_original**2 - secondary_coronal.hole_radius_original**2)
-        center_distance = primary_hohlraum.hohlraum_radius + moderator_thickness - secondary_LEH_z
-        moderator_distance = primary_hohlraum.hohlraum_radius + moderator_thickness/2
+        center_distance = primary_hohlraum.hohlraum_radius + total_thickness - secondary_LEH_z
+        moderator_distance = primary_hohlraum.hohlraum_radius + total_thickness/2
         
         # Initialize parent class
         # We'll override _create_geometry to build our specialized version
@@ -1035,5 +1073,3 @@ class DualHohlraumCoronal(DualSourceUniverse):
     
     def get_outer_region(self) -> openmc.Region:
         return self.outer_region
-        
-        

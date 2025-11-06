@@ -42,14 +42,12 @@ class DataProcessor:
         
         # Load model.xml to get geometry
         model_file = self.simulation_dir / 'model.xml'
-        geometry_file = self.simulation_dir / 'geometry.xml'
-        materials_file = self.simulation_dir / 'materials.xml'
         
-        if geometry_file.exists() and materials_file.exists():
-            self.geometry = openmc.Geometry.from_xml(geometry_file, materials_file)
-            # self.geometry = model.geometry
+        if model_file.exists():
+            model = openmc.Model.from_model_xml(model_file)
+            self.geometry = model.geometry
         else:
-            raise FileNotFoundError(f"No geometry.xml or materials.xml file found in {simulation_dir}")
+            raise FileNotFoundError(f"No model.xml file found in {simulation_dir}")
         
     def get_fuel_cell(self) -> openmc.Cell:
         """Get fuel cell object from model"""
@@ -216,7 +214,7 @@ class ResultsPlotter:
         self._plot_mesh_quadrant(fig, ax, score, corner)
         self._plot_geometry(ax)
         
-        plt.savefig(self.save_dir / f'{score}_mesh.png')
+        plt.savefig(self.save_dir / f'{score}_mesh.png', bbox_inches='tight')
         plt.close()
         
     def plot_combined_mesh(
@@ -237,7 +235,7 @@ class ResultsPlotter:
             self._plot_mesh_quadrant(fig, ax, score, corner=corners[i], cmap=cmap)
         self._plot_geometry(ax)
         
-        plt.savefig(self.save_dir / f'combined_mesh.png')
+        plt.savefig(self.save_dir / f'combined_mesh.png', bbox_inches='tight')
         plt.close()
             
     def _plot_geometry(
@@ -247,21 +245,13 @@ class ResultsPlotter:
         # Plot geometry underlay
         geometry = self.data_processor.geometry
         bounding_box = geometry.bounding_box
-        origin = (
-            (bounding_box.lower_left[0] + bounding_box.upper_right[0]) / 2,
-            0,
-            (bounding_box.lower_left[2] + bounding_box.upper_right[2]) / 2,
-        )
-        width = (
-            (bounding_box.upper_right[0] - bounding_box.lower_left[0]),
-            (bounding_box.upper_right[2] - bounding_box.lower_left[2]),
-        )
+        width = [bounding_box.width[0], bounding_box.width[2]]
         
         # Actually plot geometry
         pixels = 1000
         geometry.plot(
             axes=ax,
-            origin=origin,
+            origin=bounding_box.center,
             width=width,
             pixels=tuple([int(size * pixels / max(width)) for size in width]),
             basis='xz',
@@ -458,7 +448,7 @@ class ResultsPlotter:
         # ax.legend()
         
         # Save figure
-        fig.savefig(f'{self.save_dir}/{name}_{variable}.png', dpi=300)
+        fig.savefig(f'{self.save_dir}/{name}_{variable}.png', dpi=300, bbox_inches='tight')
         plt.close(fig)
         
     @staticmethod
