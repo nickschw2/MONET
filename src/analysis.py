@@ -394,6 +394,36 @@ class ResultsPlotter:
             step='pre'
         )
         
+        # Calculate cumulative sum and normalize to [0, 1]
+        cumsum = np.nancumsum(mean)
+        cumsum_normalized = cumsum / cumsum[-1]
+        
+        # Calculate uncertainty propagation for cumulative sum
+        cumsum_var = np.nancumsum(std**2)  # Sum of variances
+        cumsum_std = np.sqrt(cumsum_var)   # Standard deviation
+        cumsum_std_normalized = cumsum_std / cumsum[-1]  # Normalize the same way
+
+        # Create secondary y-axis for CDF
+        ax2 = ax.twinx()
+        ax2.step(x, cumsum_normalized, color='black', where='pre', 
+                label='CDF', linestyle='-', linewidth=2)
+
+        # Plot uncertainty as shaded region
+        positive = cumsum_normalized - cumsum_std_normalized > 0
+        ax2.fill_between(
+            x,
+            cumsum_normalized - cumsum_std_normalized,
+            cumsum_normalized + cumsum_std_normalized,
+            alpha=0.2,
+            color='black',
+            where=positive,
+            step='pre'
+        )
+
+        ax2.set_ylabel('Cumulative Fraction', color='black')
+        ax2.tick_params(axis='y', labelcolor='black')
+        ax2.set_ylim(0, 1)
+        
         # Add features to plots depending on whether it's a time or energy spectrum
         low_energy_threshold = self.data_processor.simulation_params['low_energy_threshold']
         colors = ['tab:orange', 'tab:green', 'tab:red', 'tab:purple']
@@ -445,7 +475,6 @@ class ResultsPlotter:
         else:
             raise ValueError('Name must be either "fuel" or "source"')
         ax.set_ylabel(ylabel)
-        # ax.legend()
         
         # Save figure
         fig.savefig(f'{self.save_dir}/{name}_{variable}.png', dpi=300, bbox_inches='tight')

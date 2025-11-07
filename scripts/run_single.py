@@ -11,26 +11,28 @@ if __name__ == "__main__":
     sim = NIFSimulation(output_dir='data/single_runs')
     source_kwargs = {'pulse_fwhm': 100e-12}
     geometry_kwargs = {
-        'primary_geometry_type': 'coronal',
+        'primary_geometry_type': 'standard',
         'secondary_geometry_type': 'coronal',
-        # 'moderator_thickness': [0.3,0.3, 0.3],
-        # 'moderator_material': ['tungsten', 'beryllium', 'ch2'],
-        # 'secondary_orientation': 'perpendicular',
-        'layered_moderator_material': ['tungsten', 'beryllium', 'lead'],
-        'layered_moderator_thickness': [0.1, 0.1, 0.1],
-        'layered_moderator_primary_gap': 0.1,
+        'moderator_thickness': [0.3,0.3, 0.3],
+        'moderator_material': ['tungsten', 'beryllium', 'ch2'],
+        # 'primary_geometry_kwargs': {
+        #     'convergence_ratio': 20.0
+        # },
+        # 'layered_moderator_material': ['lead','tungsten', 'beryllium'],
+        # 'layered_moderator_thickness': [0.1, 0.1, 0.1],
+        # 'layered_moderator_primary_gap': 0.1,
         # 'source_gap': 1.0,
         # 'hohlraum_wall_thickness': 0.07
     }
     model = sim.setup_simulation(
-        geometry_type='dual_filled_hohlraum',
+        geometry_type='dual_hohlraum_coronal',
         convergence_ratio=1.0,
         source_kwargs=source_kwargs,
         geometry_kwargs=geometry_kwargs
     )
     
     print("Running simulation...")
-    run_dir = sim.run_simulation(model=model, run_name='dual_filled_hohlraum', reset=True)
+    run_dir = sim.run_simulation(model=model, run_name='dual_hohlraum_coronal', reset=False)
     print(f"Simulation completed. Results in: {run_dir}")
     
     # Process results
