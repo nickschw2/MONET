@@ -1,5 +1,6 @@
 import openmc
 from typing import Optional, Dict
+import copy
 
 class NIFMaterial(openmc.Material):
     def __init__(
@@ -10,7 +11,6 @@ class NIFMaterial(openmc.Material):
         elements: list[str],
         fractions: list[float],
         fraction_type: str = 'ao',
-        is_compressed: bool = False,
         **kwargs
     ):
         """
@@ -30,14 +30,11 @@ class NIFMaterial(openmc.Material):
             List of element fractions in material
         fraction_type: str
             Fraction type, defaults to 'ao'
-        is_compressed: bool
-            True if material has been compressed, defaults to False
         kwargs: dict
             Additional arguments for openmc.Material
         """
         super().__init__(**kwargs)
         self.color = color
-        self.is_compressed = is_compressed
         
         # Create the material
         self.name = name
@@ -225,10 +222,8 @@ class NIFMaterials(openmc.Materials):
         )
     }
 
-    def __init__(self, convergence_ratio: float = 1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.convergence_ratio = convergence_ratio
-        
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)        
         # Add all materials from library to the collection
         for material in self.library.values():
             self.append(material)
@@ -274,7 +269,7 @@ class NIFMaterials(openmc.Materials):
             colors[material] = material.color
         return colors
     
-    def compress_density(self, name: str) -> Optional[float]:
+    def compress_density(self, name: str, tag: str, convergence_ratio: float) -> NIFMaterial:
         """Calculate compressed density based on convergence ratio
         
         Parameters:
@@ -292,21 +287,14 @@ class NIFMaterials(openmc.Materials):
         
         material = self.library[name]
         
-        if material.is_compressed:
-            print(f"Warning: Material '{name}' has already been compressed.")
-            return material.get_mass_density()
+        # Create a copy of material and rename it
+        material_new = material.clone()
+        material_new.name = f'{material.name}_{tag}'
         
-        if material.density:
-            new_density = material.density * (self.convergence_ratio ** 3)
-            material.set_density(material.density_units, new_density)
-            material.is_compressed = True
-            return material.get_mass_density()
+        if material_new.density:
+            new_density = material_new.density * (convergence_ratio ** 3)
+            material_new.set_density(material_new.density_units, new_density)
+            self.library[material_new.name] = material_new
+            return material_new
         else:
             raise ValueError(f"Material '{name}' does not have density set.")
-        
-    def get_colors(self) -> dict:
-        """Get a color definition dict with material names as keys and colors as values."""
-        colors = {}
-        for material in self.library.values():
-            colors[material] = material.color
-        return colors

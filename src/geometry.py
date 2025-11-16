@@ -13,6 +13,8 @@ class NIFUniverse(openmc.Universe):
         self,
         materials: Optional[NIFMaterials] = None,
         convergence_ratio: float = 1.0,
+        fuel_material: str = 'dt_fuel',
+        tag: Literal['primary', 'secondary'] = 'primary',
         **kwargs):
         """Initialize NIF Universe
         
@@ -22,12 +24,21 @@ class NIFUniverse(openmc.Universe):
             Materials collection
         convergence_ratio : float
             Compression ratio for implosion modeling
+        fuel_material : str
+            Fuel material
+        tag : str, optional
+            Tag to add to cell names and compressed materials
         **kwargs
             Additional parameters for openmc.Universe
         """
         super().__init__(**kwargs)
         self.materials = materials or NIFMaterials()
         self.convergence_ratio = convergence_ratio
+        self.fuel_material = fuel_material
+        self.tag = tag
+        
+        # Compress fuel material
+        self.fuel_material_compressed = self.materials.compress_density(self.fuel_material, self.tag, self.convergence_ratio)
     
     def compress_dimension(self, original_dim: float) -> float:
         """Apply compression to a dimension
@@ -82,6 +93,22 @@ class NIFUniverse(openmc.Universe):
             # If cell is filled with a universe, recurse
             if isinstance(cell.fill, NIFUniverse):
                 cell.fill.add_tag_to_cells(tag)
+                
+    def get_materials(self) -> openmc.Materials:
+        """
+        Recursively get materials
+        """
+        materials = openmc.Materials()
+        # Get all cells in this universe
+        for cell in self.cells.values():
+            if cell.fill:
+                # If the cell is filled with a universe, recurse
+                if isinstance(cell.fill, NIFUniverse):
+                    for material in cell.fill.get_materials():
+                        materials.append(material)
+                else:
+                    materials.append(cell.fill)
+        return materials
     
     @abstractmethod
     def get_fuel_params(self) -> Tuple[float, openmc.Cell]:
@@ -173,12 +200,16 @@ class StandardNIFUniverse(NIFUniverse):
         self.moderator_thickness = moderator_thickness
         
         self._create_geometry()
+        self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
         """Create the standard NIF geometry"""
-        # Apply compression to fuel and shell only
+        # Compress geometry as needed
         self.fuel_radius = self.compress_dimension(self.fuel_radius_original)
         ablator_outer_radius = self.compress_dimension(self.fuel_radius_original + self.shell_thickness_original)
+        
+        # Compress materials as needed
+        ablator_material_compressed = self.materials.compress_density(self.ablator_material, self.tag, self.convergence_ratio)
         
         # Hohlraum dimensions remain unchanged
         hohlraum_inner_radius = self.hohlraum_radius - self.hohlraum_thickness
@@ -214,14 +245,14 @@ class StandardNIFUniverse(NIFUniverse):
         ### Cells ###
         self.fuel_cell = openmc.Cell(
             name='fuel',
-            fill=self.materials['dt_fuel'],
+            fill=self.fuel_material_compressed,
             region=fuel_region
         )
         self.fuel_cell.volume = 4/3 * np.pi * self.fuel_radius**3
         
         ablator_cell = openmc.Cell(
             name='ablator',
-            fill=self.materials[self.ablator_material],
+            fill=ablator_material_compressed,
             region=ablator_region
         )
         
@@ -354,15 +385,22 @@ class DoubleShellUniverse(NIFUniverse):
         self.ablator_material = ablator_material
         
         self._create_geometry()
+        self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
         """Create the double-shell geometry"""
-        # Apply compression
+        # Compress geometry
         self.fuel_radius = self.compress_dimension(self.fuel_radius_original)
         pusher_radius = self.compress_dimension(self.pusher_radius_original)
         tamper_radius = self.compress_dimension(self.tamper_radius_original)
         foam_radius = self.compress_dimension(self.foam_radius_original)
         ablator_radius = self.compress_dimension(self.ablator_radius_original)
+        
+        # Compress materials
+        pusher_material_compressed = self.materials.compress_density(self.pusher_material, self.tag, self.convergence_ratio)
+        tamper_material_compressed = self.materials.compress_density(self.tamper_material, self.tag, self.convergence_ratio)
+        foam_material_compressed = self.materials.compress_density(self.foam_material, self.tag, self.convergence_ratio)
+        ablator_material_compressed = self.materials.compress_density(self.ablator_material, self.tag, self.convergence_ratio)
         
         # Create surfaces
         fuel_surface = openmc.Sphere(r=self.fuel_radius)
@@ -379,7 +417,7 @@ class DoubleShellUniverse(NIFUniverse):
         self.fuel_cell = openmc.Cell(
             name='fuel',
             region=-fuel_surface,
-            fill=self.materials['dt_fuel']
+            fill=self.fuel_material_compressed
         )
         self.fuel_cell.volume = 4/3 * np.pi * self.fuel_radius**3
         self.add_cell(self.fuel_cell)
@@ -388,7 +426,7 @@ class DoubleShellUniverse(NIFUniverse):
         pusher_cell = openmc.Cell(
             name='pusher',
             region=+fuel_surface & -pusher_surface,
-            fill=self.materials[self.pusher_material]
+            fill=pusher_material_compressed
         )
         self.add_cell(pusher_cell)
         
@@ -396,7 +434,7 @@ class DoubleShellUniverse(NIFUniverse):
         tamper_cell = openmc.Cell(
             name='tamper',
             region=+pusher_surface & -tamper_surface,
-            fill=self.materials[self.tamper_material]
+            fill=tamper_material_compressed
         )
         self.add_cell(tamper_cell)
         
@@ -404,7 +442,7 @@ class DoubleShellUniverse(NIFUniverse):
         foam_cell = openmc.Cell(
             name='foam',
             region=+tamper_surface & -foam_surface,
-            fill=self.materials[self.foam_material]
+            fill=foam_material_compressed
         )
         self.add_cell(foam_cell)
         
@@ -412,7 +450,7 @@ class DoubleShellUniverse(NIFUniverse):
         ablator_cell = openmc.Cell(
             name='ablator',
             region=+foam_surface & -ablator_surface,
-            fill=self.materials[self.ablator_material]
+            fill=ablator_material_compressed
         )
         self.add_cell(ablator_cell)
         
@@ -479,15 +517,19 @@ class CoronalUniverse(NIFUniverse):
             raise ValueError("Hole radius must be less than capsule radius")
         
         self._create_geometry()
+        self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
         """Create the coronal source geometry"""
-        # Apply compression
+        # Compress geometry
         capsule_radius = self.compress_dimension(self.capsule_radius_original)
         capsule_thickness = self.compress_dimension(self.capsule_thickness_original)
         lining_thickness = self.compress_dimension(self.lining_thickness_original)
         ice_thickness = self.compress_dimension(self.ice_thickness_original)
         hole_radius = self.compress_dimension(self.hole_radius_original)
+        
+        # Compress materials
+        capsule_material_compressed = self.materials.compress_density(self.capsule_material, self.tag, self.convergence_ratio)
         
         # Define fuel radius
         self.fuel_radius = capsule_radius - capsule_thickness - lining_thickness - ice_thickness
@@ -509,7 +551,7 @@ class CoronalUniverse(NIFUniverse):
         self.fuel_cell = openmc.Cell(
             name='fuel',
             region=fuel_region,
-            fill=self.materials['dt_fuel']
+            fill=self.fuel_material_compressed
         )
         # Calculate the volume of fuel cell
         cap_height = self.fuel_radius + z_loc
@@ -520,19 +562,22 @@ class CoronalUniverse(NIFUniverse):
         capsule_cell = openmc.Cell(
             name='capsule',
             region=capsule_region,
-            fill=self.materials[self.capsule_material]
+            fill=capsule_material_compressed
         )
         self.add_cell(capsule_cell)
         
         ### OPTIONAL FEATURES ###
         if self.lining_thickness_original > 0.0 and self.lining_material:
+            # Compress material
+            lining_material_compressed = self.materials.compress_density(self.lining_material, self.tag, self.convergence_ratio)
+            # Construct geometry
             lining_radius = capsule_radius - capsule_thickness
             lining_surface = openmc.Sphere(r=lining_radius)
             lining_region = -lining_surface & +fuel_surface & +hole1_plane
             lining_cell = openmc.Cell(
                 name='lining',
                 region=lining_region,
-                fill=self.materials[self.lining_material]
+                fill=lining_material_compressed
             )
             self.add_cell(lining_cell)
             
@@ -540,13 +585,16 @@ class CoronalUniverse(NIFUniverse):
             capsule_cell.region &= +lining_surface
             
         if ice_thickness > 0.0 and self.ice_material:
+            # Compress material
+            ice_material_compressed = self.materials.compress_density(self.ice_material, self.tag, self.convergence_ratio)
+            # Construct geometry
             ice_radius = capsule_radius - capsule_thickness - lining_thickness
             ice_surface = openmc.Sphere(r=ice_radius)
             ice_region = -ice_surface & +fuel_surface & +hole1_plane
             ice_cell = openmc.Cell(
                 name='ice',
                 region=ice_region,
-                fill=self.materials[self.ice_material]
+                fill=ice_material_compressed
             )
             self.add_cell(ice_cell)
             
@@ -744,6 +792,7 @@ class DualSourceUniverse(NIFUniverse):
             fill=self.primary_geom,
             region=self.transformed_primary_geom_region
         )
+        
         # Need to rotate primary in opposite direction if secondary is perpendicular and coronal
         if self.secondary_orientation == 'perpendicular' and isinstance(self.primary_geom, CoronalUniverse):
             primary_geom_cell.rotation = -rotation

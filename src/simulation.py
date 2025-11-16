@@ -1,10 +1,8 @@
 import openmc
 import os
 import json
-import numpy as np
 from typing import Optional, Dict, Any, Union, Literal
 from pathlib import Path
-import inspect
 
 from .materials import NIFMaterials
 from .sources import SphericalSource
@@ -16,7 +14,7 @@ class NIFModel(openmc.Model):
     
     def __init__(self,
                  geometry: Optional[openmc.Geometry] = None,
-                 materials: Optional[NIFMaterials] = None,
+                 materials: Optional[openmc.Materials] = None,
                  settings: Optional[openmc.Settings] = None,
                  tallies: Optional[NIFTallies] = None):
         """Initialize NIF model
@@ -65,7 +63,7 @@ class NIFSimulation:
         # Simulation parameters
         batches: int = 100,
         particles_per_batch: int = int(1e5),
-        convergence_ratio: float = 40.0,
+        convergence_ratio: Union[float, Dict[Literal['primary', 'secondary'], float]] = 1.0,
         trace_nuclide: str = 'Tm171',
         fuel_fraction: float = 0.5,
         geometry_kwargs: Optional[Dict[str, Any]] = None,
@@ -107,7 +105,7 @@ class NIFSimulation:
             Configured simulation model
         """
         # Create materials
-        materials = NIFMaterials(convergence_ratio=convergence_ratio)
+        materials = NIFMaterials()
         # Create DT fuel
         fuel = materials.create_dt_fuel(
             trace_nuclide=trace_nuclide,
@@ -115,19 +113,20 @@ class NIFSimulation:
             **fuel_kwargs or {}
         )
         
-        # Compress fuel, the rest will be compressed in _setup_geometry
-        materials.compress_density('dt_fuel')
-        
         # Create settings
         settings = openmc.Settings(**settings_kwargs or {})
         settings.run_mode = "fixed source"
         settings.batches = batches
         settings.particles = particles_per_batch
         settings.output = {'tallies': True}
+        
+        # Modify convergence ratio
+        if isinstance(convergence_ratio, float):
+            convergence_ratio = {'primary': convergence_ratio}
                 
         # Create geometry
         if geometry_type == 'dual_source' or geometry_type == 'dual_filled_hohlraum' or geometry_type == 'dual_hohlraum_coronal':
-            universe = self._setup_dual_source_geometry(geometry_type, materials, **geometry_kwargs or {})
+            universe = self._setup_dual_source_geometry(geometry_type, materials, convergence_ratio, **geometry_kwargs or {})
             primary_fuel_radius, primary_fuel_cell = universe.primary_geom.get_fuel_params()
             secondary_fuel_radius, secondary_fuel_cell = universe.secondary_geom.get_fuel_params()
             primary_fuel_radius_compressed = primary_fuel_radius / universe.primary_geom.convergence_ratio
@@ -163,7 +162,7 @@ class NIFSimulation:
             settings.source = [primary_source]
             # settings.source = [primary_source, secondary_source]
         else:
-            universe = self._setup_geometry(geometry_type, materials, **geometry_kwargs or {})
+            universe = self._setup_geometry(geometry_type, materials, convergence_ratio, **geometry_kwargs or {})
 
             # Calculate fuel radius after compression
             fuel_radius, fuel_cell = universe.get_fuel_params()
@@ -196,7 +195,8 @@ class NIFSimulation:
         model = NIFModel(
             geometry=geometry,
             settings=settings,
-            tallies=tallies
+            tallies=tallies,
+            materials=universe.get_materials()
         )
         
         # Store parameters and universe for later use
@@ -232,6 +232,8 @@ class NIFSimulation:
         self,
         geometry_type: Literal['standard', 'double_shell', 'coronal'],
         materials: NIFMaterials,
+        convergence_ratio: float,
+        tag: Literal['primary', 'secondary'] = 'primary',
         **kwargs
     ) -> NIFUniverse:
         """
@@ -242,6 +244,10 @@ class NIFSimulation:
             Geometry type, one of ['standard', 'double_shell', 'coronal']
         materials : NIFMaterials
             Material database
+        convergence_ratio : float
+            Compression ratio for geometry and materials
+        tag : str
+            Tag to add to cell names and compressed materials
         **kwargs
             Additional parameters for NIFUniverse
         
@@ -250,63 +256,30 @@ class NIFSimulation:
             Configured universe
         """
         
-        # Helper function for compressing materials
-        def compress_material(material_name: str) -> None:
-            # If material is in kwargs, compress it
-            if material_name in kwargs:
-                # Get material
-                material = kwargs[material_name]
-            
-            # If material is not in kwargs, get default from init function 
-            else:
-                # Get init function default value
-                if geometry_type == 'standard':
-                    init_function = StandardNIFUniverse.__init__
-                elif geometry_type == 'double_shell':
-                    init_function = DoubleShellUniverse.__init__
-                elif geometry_type == 'coronal':
-                    init_function = CoronalUniverse.__init__
-                
-                material = inspect.signature(init_function).parameters[material_name].default
-                
-                # Adds material to kwargs if not already there   
-                kwargs[material_name] = material
-            
-            # Compress material if it exists
-            if material:
-                materials.compress_density(material)
-                
-        
         if geometry_type == 'standard':
-            # Compress ablator
-            compress_material('ablator_material')
-                
             return StandardNIFUniverse(
                 materials=materials,
-                convergence_ratio=materials.convergence_ratio,
+                convergence_ratio=convergence_ratio,
+                tag=tag,
                 **kwargs or {}
             )
             
-        elif geometry_type == 'double_shell':
-            compress_material('pusher_material')
-            compress_material('tamper_material')
-            compress_material('foam_material')
-            compress_material('ablator_material')
-            
+        elif geometry_type == 'double_shell':            
             return DoubleShellUniverse(
                 materials=materials,
-                convergence_ratio=materials.convergence_ratio,
+                convergence_ratio=convergence_ratio,
+                tag=tag,
                 **kwargs or {}
             )
             
         elif geometry_type == 'coronal':
-            compress_material('capsule_material')
-            compress_material('lining_material')
-            compress_material('ice_material')
+            if convergence_ratio != 1.0:
+                raise ValueError(f'Convergence ratio of coronal target cannot be {convergence_ratio}, as it is always 1 because they are not compressed.')
             
             return CoronalUniverse(
                 materials=materials,
-                convergence_ratio=materials.convergence_ratio,
+                convergence_ratio=convergence_ratio,
+                tag=tag,
                 **kwargs or {}
             )
             
@@ -317,6 +290,7 @@ class NIFSimulation:
         self,
         type: Literal['dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal'],
         materials: NIFMaterials,
+        convergence_ratio: Dict[Literal['primary', 'secondary'], float],
         primary_geometry_type: Literal['standard', 'double_shell', 'coronal'],
         secondary_geometry_type: Literal['standard', 'double_shell', 'coronal'],
         primary_geometry_kwargs: Optional[Dict[str, Any]] = None,
@@ -349,12 +323,16 @@ class NIFSimulation:
         primary_geom = self._setup_geometry(
             geometry_type=primary_geometry_type,
             materials=materials,
+            convergence_ratio=convergence_ratio['primary'],
+            tag='primary',
             **(primary_geometry_kwargs or {})
         )
         
         secondary_geom = self._setup_geometry(
             geometry_type=secondary_geometry_type,
             materials=materials,
+            convergence_ratio=convergence_ratio['secondary'],
+            tag='secondary',
             **(secondary_geometry_kwargs or {})
         )
         
