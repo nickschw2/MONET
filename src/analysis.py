@@ -8,7 +8,6 @@ import json
 from typing import Optional, List, Tuple, Union, Dict, Literal
 
 from .materials import NIFMaterials
-from .geometry import DualSourceUniverse, DualFilledHohlraum
 
 # Set plotting params
 plt.rcParams['font.size'] = 20

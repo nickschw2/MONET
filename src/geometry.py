@@ -107,7 +107,9 @@ class NIFUniverse(openmc.Universe):
                     for material in cell.fill.get_materials():
                         materials.append(material)
                 else:
-                    materials.append(cell.fill)
+                    # Skip over materials that have already been added
+                    if cell.fill not in materials:
+                        materials.append(cell.fill)
         return materials
     
     @abstractmethod
@@ -1011,7 +1013,6 @@ class DualFilledHohlraum(DualSourceUniverse):
                     openmc.ZPlane(start_z + np.sum(self.layered_moderator_thickness[:i+1]))
                 )
             
-            total_thickness = np.sum(self.layered_moderator_thickness)
             # Create moderator cells
             for i, material in enumerate(self.layered_moderator_material):
                 moderator_region = -self.moderator_cyl & +layered_moderator_planes[i] & -layered_moderator_planes[i+1]
@@ -1065,6 +1066,8 @@ class DualHohlraumCoronal(DualSourceUniverse):
         secondary_coronal: CoronalUniverse,
         moderator_thickness: Union[float, Sequence[float]] = 0.6,
         moderator_material: Union[str, Sequence[str]] = 'ch2',
+        reflector_thickness: float = 0.03,
+        reflector_material: str = 'gold',
         **kwargs
     ):
         """
@@ -1080,18 +1083,24 @@ class DualHohlraumCoronal(DualSourceUniverse):
             Moderator thickness in cm
         moderator_material : str, Sequence[str]
             Moderator material name
+        reflector_thickness : float
+            Reflector thickness in cm
+        reflector_material : str
+            Reflector material name
         """
         self.primary_hohlraum = primary_hohlraum
         self.secondary_coronal = secondary_coronal
         if isinstance(moderator_thickness, float):
-            total_thickness = moderator_thickness
+            self.total_thickness = moderator_thickness
         else:
-            total_thickness = np.sum(moderator_thickness)
+            self.total_thickness = np.sum(moderator_thickness)
+        self.reflector_thickness = reflector_thickness
+        self.reflector_material = reflector_material
         
         # Calculate distances
         secondary_LEH_z = np.sqrt(secondary_coronal.capsule_radius_original**2 - secondary_coronal.hole_radius_original**2)
-        center_distance = primary_hohlraum.hohlraum_radius + total_thickness - secondary_LEH_z
-        moderator_distance = primary_hohlraum.hohlraum_radius + total_thickness/2
+        center_distance = primary_hohlraum.hohlraum_radius + self.total_thickness - secondary_LEH_z
+        moderator_distance = primary_hohlraum.hohlraum_radius + self.total_thickness/2
         
         # Initialize parent class
         # We'll override _create_geometry to build our specialized version
@@ -1120,19 +1129,39 @@ class DualHohlraumCoronal(DualSourceUniverse):
                 self.remove_cell(cell)
                 break
             
-        # Define outer region
-        # self.outer_region = self.primary_geom.get_outer_region() | self.secondary_geom.get_outer_region() | -self.moderator_rcc
+        # Create reflector region around the moderator
+        reflector_radius = self.moderator_radius + self.reflector_thickness
+        reflector_outer_cylinder = openmc.XCylinder(r=reflector_radius)
+        reflector_top = self.moderator_planes[0]
+        reflector_bottom_inside = self.moderator_planes[-1]
+        reflector_bottom_outside = openmc.XPlane(self.total_thickness / 2 + self.reflector_thickness)
+        secondary_LEH_cylinder = openmc.XCylinder(r=self.secondary_coronal.hole_radius_original)
+        
+        reflector_wall_region = -reflector_outer_cylinder & +self.moderator_cyl & +reflector_top & -reflector_bottom_inside
+        reflector_base_region = -reflector_outer_cylinder & +secondary_LEH_cylinder & +reflector_bottom_inside & -reflector_bottom_outside
+        reflector_region = reflector_wall_region | reflector_base_region
+        
+        # Modify outer region to include reflector
+        self.outer_region |= reflector_region
+        
+        # Add reflector cell
+        reflector_cell = openmc.Cell(
+            name='reflector_cell',
+            region=reflector_region,
+            fill=self.materials[self.reflector_material]
+        )
+        self.add_cell(reflector_cell)
             
         # Vacuum cell
         # slightly larger than geometry to account for rounding errors
         multiplier = 1.1
         vacuum_box = BOX(
             xmin=(self.primary_translation - self.primary_hohlraum.hohlraum_radius) * multiplier,
-            xmax=(self.secondary_translation + self.secondary_coronal.capsule_radius_original) * multiplier,
-            ymin=-self.moderator_radius * multiplier,
-            ymax=self.moderator_radius * multiplier,
-            zmin=-self.moderator_radius * multiplier,
-            zmax=self.moderator_radius * multiplier,
+            xmax=(self.secondary_translation + self.secondary_coronal.capsule_radius_original + self.reflector_thickness) * multiplier,
+            ymin=-reflector_radius * multiplier,
+            ymax=reflector_radius * multiplier,
+            zmin=-reflector_radius * multiplier,
+            zmax=reflector_radius * multiplier,
             boundary_type='vacuum'
         )
         
