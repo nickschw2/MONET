@@ -219,7 +219,21 @@ class NIFMaterials(openmc.Materials):
             elements=['Pb'],
             fractions=[1], 
             density=11.35,
-        )
+        ),
+        "lithium-6": NIFMaterial(
+            name='lithium-6', 
+            color='cyan',
+            elements=['Li6'],
+            fractions=[1], 
+            density=0.534,
+        ),
+        "flibe": NIFMaterial(
+            name='flibe', 
+            color='orange',
+            elements=['Li', 'Be', 'F'],
+            fractions=[2, 1, 4], 
+            density=1.94,
+        ),
     }
 
     def __init__(self, **kwargs):
@@ -253,8 +267,11 @@ class NIFMaterials(openmc.Materials):
         
         return fuel
     
-    def __getitem__(self, name: str) -> openmc.Material:
+    def __getitem__(self, name: Optional[str]) -> Optional[openmc.Material]:
         """Get material by name"""
+        if name is None:
+            print("Warning: Material name is None, returning None")
+            return None
         if name not in self.library:
             if name == 'dt_fuel':
                 raise ValueError("DT fuel material not found. Use create_dt_fuel() to create it.")
@@ -268,33 +285,3 @@ class NIFMaterials(openmc.Materials):
         for material in self.library.values():
             colors[material] = material.color
         return colors
-    
-    def compress_density(self, name: str, tag: str, convergence_ratio: float) -> NIFMaterial:
-        """Calculate compressed density based on convergence ratio
-        
-        Parameters:
-        -----------
-        name: str
-            Name of material for which density should be compressed
-            
-        Returns:
-        --------
-        float or None
-            The new mass density after compression, or None if material not found
-        """
-        if name not in self.library:
-            raise ValueError(f"Material '{name}' not found for density compression. Available materials: {list(self.library.keys())}")
-        
-        material = self.library[name]
-        
-        # Create a copy of material and rename it
-        material_new = material.clone()
-        material_new.name = f'{material.name}_{tag}'
-        
-        if material_new.density:
-            new_density = material_new.density * (convergence_ratio ** 3)
-            material_new.set_density(material_new.density_units, new_density)
-            self.library[material_new.name] = material_new
-            return material_new
-        else:
-            raise ValueError(f"Material '{name}' does not have density set.")

@@ -235,7 +235,7 @@ class NIFSimulation:
         convergence_ratio: float,
         tag: Literal['primary', 'secondary'] = 'primary',
         **kwargs
-    ) -> NIFUniverse:
+    ) -> BaseImplosionUniverse:
         """
         Helper function for setting up the geometry.
         
@@ -249,15 +249,15 @@ class NIFSimulation:
         tag : str
             Tag to add to cell names and compressed materials
         **kwargs
-            Additional parameters for NIFUniverse
+            Additional parameters for BaseImplosionUniverse
         
         Returns:
-        NIFUniverse
+        BaseImplosionUniverse
             Configured universe
         """
         
         if geometry_type == 'standard':
-            return StandardNIFUniverse(
+            return IndirectDriveUniverse(
                 materials=materials,
                 convergence_ratio=convergence_ratio,
                 tag=tag,
@@ -310,9 +310,9 @@ class NIFSimulation:
         secondary_geometry_type : str
             Secondary geometry type, one of ['standard', 'double_shell', 'coronal']
         primary_geometry_kwargs : dict, optional
-            Additional parameters for primary NIFUniverse
+            Additional parameters for primary BaseImplosionUniverse
         secondary_geometry_kwargs : dict, optional
-            Additional parameters for secondary NIFUniverse
+            Additional parameters for secondary BaseImplosionUniverse
         **kwargs
             Additional parameters for DualSourceUniverse
         
@@ -354,7 +354,7 @@ class NIFSimulation:
                 **kwargs or {}
             )
         elif type == 'dual_hohlraum_coronal':
-            if not isinstance(primary_geom, StandardNIFUniverse) or not isinstance(secondary_geom, CoronalUniverse):
+            if not isinstance(primary_geom, IndirectDriveUniverse) or not isinstance(secondary_geom, CoronalUniverse):
                 raise ValueError("Both primary and secondary geometries must be 'coronal' for 'dual_hohlraum_coronal' type")
             
             universe = DualHohlraumCoronal(

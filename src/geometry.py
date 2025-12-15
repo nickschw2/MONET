@@ -1,19 +1,23 @@
 import openmc
 from openmc.model import RectangularParallelepiped as BOX
 from openmc.model import RightCircularCylinder as RCC
+from openmc.model import ConicalFrustum
 import numpy as np
 from typing import Optional, Literal, Tuple, Union, Sequence
 from abc import abstractmethod
 from .materials import NIFMaterials
 
-class NIFUniverse(openmc.Universe):
-    """Base class for NIF target geometries"""
+class BaseImplosionUniverse(openmc.Universe):
+    """Base class for spherical implosion geometry"""
     
     def __init__(
         self,
         materials: Optional[NIFMaterials] = None,
         convergence_ratio: float = 1.0,
+        fuel_radius_original: float = 0.1,
+        ablator_thickness_original: float = 0.01,
         fuel_material: str = 'dt_fuel',
+        ablator_material: str = 'ch2',
         tag: Literal['primary', 'secondary'] = 'primary',
         **kwargs):
         """Initialize NIF Universe
@@ -24,36 +28,92 @@ class NIFUniverse(openmc.Universe):
             Materials collection
         convergence_ratio : float
             Compression ratio for implosion modeling
+        fuel_radius_original : float
+            Original fuel radius in cm
+        ablator_thickness_original : float
+            Original ablator thickness in cm
         fuel_material : str
             Fuel material
+        ablator_material : str
+            Ablator material
         tag : str, optional
-            Tag to add to cell names and compressed materials
+            Tag to add to cell names
         **kwargs
             Additional parameters for openmc.Universe
         """
         super().__init__(**kwargs)
         self.materials = materials or NIFMaterials()
         self.convergence_ratio = convergence_ratio
-        self.fuel_material = fuel_material
+        self.fuel_radius_original = fuel_radius_original
+        self.ablator_thickness_original = ablator_thickness_original
+        self.fuel_material = self.materials[fuel_material]
+        self.ablator_material = self.materials[ablator_material]
         self.tag = tag
         
-        # Compress fuel material
-        self.fuel_material_compressed = self.materials.compress_density(self.fuel_material, self.tag, self.convergence_ratio)
+        self._create_base_geometry()
+        self.add_tag_to_cells(self.tag)
+      
+    def _create_base_geometry(self) -> None:
+        # Compress fuel and ablator
+        self.fuel_radius, self.fuel_density = self.compress_dimension(self.fuel_radius_original, self.fuel_material)
+        self.ablator_thickness, ablator_density = self.compress_dimension(self.ablator_thickness_original, self.ablator_material)
+        
+        # Create surfaces, regions, and cells
+        fuel_surface = openmc.Sphere(r=self.fuel_radius)
+        ablator_surface = openmc.Sphere(r=self.fuel_radius + self.ablator_thickness, boundary_type='vacuum')
+        
+        fuel_region = -fuel_surface
+        ablator_region = -ablator_surface & +fuel_surface
+        
+        # Define outer_region
+        self.outer_region = -ablator_surface
+        
+        self.fuel_cell = openmc.Cell(
+            name='fuel',
+            region=fuel_region,
+            fill=self.fuel_material
+        )
+        self.fuel_cell.density = self.fuel_density
+        self.fuel_cell.volume = 4/3 * np.pi * self.fuel_radius**3
+        
+        self.ablator_cell = openmc.Cell(
+            name='ablator',
+            region=ablator_region,
+            fill=self.ablator_material
+        )
+        self.ablator_cell.density = ablator_density
+        
+        self.add_cells([self.fuel_cell, self.ablator_cell])
+        
+    @abstractmethod
+    def _create_geometry(self) -> None:
+        """Create the specific geometry"""
+        pass
     
-    def compress_dimension(self, original_dim: float) -> float:
+    def compress_dimension(self, original_dim: float, material: Optional[openmc.Material] = None) -> Tuple[float, Optional[float]]:
         """Apply compression to a dimension
         
         Parameters:
         -----------
         original_dim : float
             Original dimension before compression
+        original_density : float
+            Original density before compression
             
         Returns:
         --------
         float
             Compressed dimension
         """
-        return original_dim / self.convergence_ratio
+        new_dim = original_dim / self.convergence_ratio
+        if material is None:
+            new_density = None
+        else:
+            if material.density:
+                new_density = material.density * (self.convergence_ratio ** 3)
+            else:
+                raise ValueError(f"Material {material.name} has no density defined.")
+        return new_dim, new_density
     
     def remove_vacuum_boundaries(self):
         """
@@ -73,7 +133,7 @@ class NIFUniverse(openmc.Universe):
                         surface.boundary_type = 'transmission'
             
             # If the cell is filled with a universe, recurse
-            if isinstance(cell.fill, NIFUniverse):
+            if isinstance(cell.fill, BaseImplosionUniverse):
                 cell.fill.remove_vacuum_boundaries()
     
     def add_tag_to_cells(self, tag: str):
@@ -91,7 +151,7 @@ class NIFUniverse(openmc.Universe):
                 cell.name = f'{cell.name}_{tag}'
             
             # If cell is filled with a universe, recurse
-            if isinstance(cell.fill, NIFUniverse):
+            if isinstance(cell.fill, BaseImplosionUniverse):
                 cell.fill.add_tag_to_cells(tag)
                 
     def get_materials(self) -> openmc.Materials:
@@ -103,7 +163,7 @@ class NIFUniverse(openmc.Universe):
         for cell in self.cells.values():
             if cell.fill:
                 # If the cell is filled with a universe, recurse
-                if isinstance(cell.fill, NIFUniverse):
+                if isinstance(cell.fill, BaseImplosionUniverse):
                     for material in cell.fill.get_materials():
                         materials.append(material)
                 else:
@@ -112,7 +172,6 @@ class NIFUniverse(openmc.Universe):
                         materials.append(cell.fill)
         return materials
     
-    @abstractmethod
     def get_fuel_params(self) -> Tuple[float, openmc.Cell]:
         """
         Get parameters for the fuel cell
@@ -122,10 +181,8 @@ class NIFUniverse(openmc.Universe):
         Tuple[float, openmc.Cell]
             Tuple of (radius, cell)
         """
-        # Must be implemented in subclasses
-        pass
+        return self.fuel_radius, self.fuel_cell
     
-    @abstractmethod
     def get_outer_region(self) -> openmc.Region:
         """
         Get the outer region of the geometry so that it can be manipulated
@@ -136,21 +193,17 @@ class NIFUniverse(openmc.Universe):
         openmc.Region
             Outer region
         """
-        # Must be implemented in subclass
-        pass
+        return self.outer_region
 
-class StandardNIFUniverse(NIFUniverse):
+class IndirectDriveUniverse(BaseImplosionUniverse):
     """Standard NIF indirect-drive target geometry"""
     
     def __init__(
         self,
-        fuel_radius_original: float = 0.1,
-        shell_thickness_original: float = 100e-4,
         hohlraum_length: float = 1.0,
         hohlraum_radius: float = 0.3,
         hohlraum_thickness: float = 300e-4,
         leh_radius: float = 0.05,
-        ablator_material: str = 'ch2',
         hohlraum_material: str = 'gold',
         hohlraum_lining_thickness: Optional[float] = None,
         hohlraum_lining_material: Optional[str] = None,
@@ -161,10 +214,6 @@ class StandardNIFUniverse(NIFUniverse):
         
         Parameters:
         -----------
-        fuel_radius_original : float
-            Original fuel radius in cm
-        shell_thickness_original : float
-            Original shell thickness in cm
         hohlraum_length : float
             Hohlraum length in cm
         hohlraum_radius : float
@@ -173,8 +222,6 @@ class StandardNIFUniverse(NIFUniverse):
             Hohlraum wall thickness in cm
         leh_radius : float
             Laser entrance hole radius in cm
-        ablator_material : str
-            Name of ablator material
         hohlraum_material : str
             Name of hohlraum material
         hohlraum_lining_thickness : float
@@ -184,44 +231,30 @@ class StandardNIFUniverse(NIFUniverse):
         moderator_thickness : float
             Thickness of moderator layer in cm
         **kwargs
-            Additional parameters for NIFUniverse
+            Additional parameters for BaseImplosionUniverse
         """
         super().__init__(**kwargs)
         
-        self.fuel_radius_original = fuel_radius_original
-        self.shell_thickness_original = shell_thickness_original
         self.hohlraum_length = hohlraum_length
         self.hohlraum_radius = hohlraum_radius
         self.hohlraum_thickness = hohlraum_thickness
         self.leh_radius = leh_radius
-        self.hohlraum_lining_material = hohlraum_lining_material
-        self.ablator_material = ablator_material
-        self.hohlraum_material = hohlraum_material
+        self.hohlraum_lining_material = self.materials[hohlraum_lining_material]
+        self.hohlraum_material = self.materials[hohlraum_material]
         self.hohlraum_lining_thickness = hohlraum_lining_thickness
-        self.moderator_material = moderator_material
+        self.moderator_material = self.materials[moderator_material]
         self.moderator_thickness = moderator_thickness
+        
+        # Remove vacuum boundaries from surfaces
+        self.remove_vacuum_boundaries()
         
         self._create_geometry()
         self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
-        """Create the standard NIF geometry"""
-        # Compress geometry as needed
-        self.fuel_radius = self.compress_dimension(self.fuel_radius_original)
-        ablator_outer_radius = self.compress_dimension(self.fuel_radius_original + self.shell_thickness_original)
-        
-        # Compress materials as needed
-        ablator_material_compressed = self.materials.compress_density(self.ablator_material, self.tag, self.convergence_ratio)
-        
-        # Hohlraum dimensions remain unchanged
+        """Create the standard NIF geometry"""       
+        # Hohlraum dimensions remain unchanged     
         hohlraum_inner_radius = self.hohlraum_radius - self.hohlraum_thickness
-        
-        # Create surfaces
-        # Fuel sphere
-        fuel_surface = openmc.Sphere(r=self.fuel_radius)
-        
-        # Ablator outer surface
-        ablator_surface = openmc.Sphere(r=ablator_outer_radius)
         
         # Hohlraum surfaces
         hohlraum_inner_cyl = openmc.ZCylinder(r=hohlraum_inner_radius)
@@ -235,32 +268,22 @@ class StandardNIFUniverse(NIFUniverse):
         leh_upper_inside = openmc.ZPlane(z0=self.hohlraum_length/2 - self.hohlraum_thickness)
         
         ### Regions ###
-        fuel_region = -fuel_surface
-        ablator_region = -ablator_surface & +fuel_surface
         hohlraum_walls_region = +hohlraum_inner_cyl & -hohlraum_outer_cyl & +hohlraum_bottom & -hohlraum_top
         leh_lower_region = -hohlraum_inner_cyl & +leh_cylinder & -leh_lower_inside & +hohlraum_bottom
         leh_upper_region = -hohlraum_inner_cyl & +leh_cylinder & +leh_upper_inside & -hohlraum_top
         hohlraum_region = hohlraum_walls_region | leh_lower_region | leh_upper_region
+        
+        # Define vacuum region with parent's outer_region
+        parent_outer_region = self.outer_region
+        vacuum_region = -hohlraum_outer_cyl & ~parent_outer_region & +hohlraum_bottom & -hohlraum_top & ~hohlraum_region
+        
+        # Redefine outer_region
         self.outer_region = -hohlraum_outer_cyl & +hohlraum_bottom & -hohlraum_top
-        vacuum_region = -hohlraum_outer_cyl & +ablator_surface & +hohlraum_bottom & -hohlraum_top & ~hohlraum_region
         
         ### Cells ###
-        self.fuel_cell = openmc.Cell(
-            name='fuel',
-            fill=self.fuel_material_compressed,
-            region=fuel_region
-        )
-        self.fuel_cell.volume = 4/3 * np.pi * self.fuel_radius**3
-        
-        ablator_cell = openmc.Cell(
-            name='ablator',
-            fill=ablator_material_compressed,
-            region=ablator_region
-        )
-        
         hohlraum_cell = openmc.Cell(
             name='hohlraum',
-            fill=self.materials[self.hohlraum_material],
+            fill=self.hohlraum_material,
             region=hohlraum_region
         )
         
@@ -270,10 +293,7 @@ class StandardNIFUniverse(NIFUniverse):
             region=vacuum_region
         )
         
-        self.add_cell(self.fuel_cell)
-        self.add_cell(ablator_cell)
-        self.add_cell(hohlraum_cell)
-        self.add_cell(vacuum_cell)
+        self.add_cells([hohlraum_cell, vacuum_cell])
         
         # Optional features
         if self.hohlraum_lining_thickness and self.hohlraum_lining_material:
@@ -293,7 +313,7 @@ class StandardNIFUniverse(NIFUniverse):
             # Lining cell
             lining_cell = openmc.Cell(
                 name='hohlraum_lining',
-                fill=self.materials[self.hohlraum_lining_material],
+                fill=self.hohlraum_lining_material,
                 region=lining_region
             )
             self.add_cell(lining_cell)
@@ -316,7 +336,7 @@ class StandardNIFUniverse(NIFUniverse):
             """Create moderator cell around hohlraum"""
             moderator_cell = openmc.Cell(
                 name='moderator',
-                fill=self.materials[self.moderator_material],
+                fill=self.moderator_material,
                 region=moderator_region
             )
             self.add_cell(moderator_cell)
@@ -325,66 +345,47 @@ class StandardNIFUniverse(NIFUniverse):
             self.outer_region = -moderator_outer_cyl & +hohlraum_bottom & -hohlraum_top
             
         self.add_cell(vacuum_cell)
-        
-    def get_fuel_params(self) -> Tuple[float, openmc.Cell]:
-        return self.fuel_radius, self.fuel_cell
-    
-    def get_outer_region(self) -> openmc.Region:
-        
-        return self.outer_region
 
-class DoubleShellUniverse(NIFUniverse):
+class DoubleShellUniverse(BaseImplosionUniverse):
     """Double-shell target geometry"""
     
     def __init__(
         self,
-        fuel_radius_original: float = 271e-4,
         pusher_radius_original: float = 321e-4,
         tamper_radius_original: float = 372e-4,
         foam_radius_original: float = 1191e-4,
-        ablator_radius_original: float = 1386e-4,
         pusher_material: str = 'tungsten',
         tamper_material: str = 'ch2',
         foam_material: str = 'ch',
-        ablator_material: str = 'aluminum',
         **kwargs
     ):
         """Initialize double-shell geometry
         
         Parameters:
         -----------
-        fuel_radius_original : float
-            Original fuel radius in cm
         pusher_radius_original : float
             Original pusher radius in cm
         tamper_radius_original : float
             Original tamper radius in cm
         foam_radius_original : float
             Original foam radius in cm
-        ablator_radius_original : float
-            Original ablator radius in cm
         pusher_material : str
             Name of pusher material
         tamper_material : str
             Name of tamper material
         foam_material : str
             Name of foam material
-        ablator_material : str
-            Name of ablator material
         **kwargs
-            Additional parameters for NIFUniverse
+            Additional parameters for BaseImplosionUniverse
         """
         super().__init__(**kwargs)
         
-        self.fuel_radius_original = fuel_radius_original
         self.pusher_radius_original = pusher_radius_original
         self.tamper_radius_original = tamper_radius_original
         self.foam_radius_original = foam_radius_original
-        self.ablator_radius_original = ablator_radius_original
-        self.pusher_material = pusher_material
-        self.tamper_material = tamper_material
-        self.foam_material = foam_material
-        self.ablator_material = ablator_material
+        self.pusher_material = self.materials[pusher_material]
+        self.tamper_material = self.materials[tamper_material]
+        self.foam_material = self.materials[foam_material]
         
         self._create_geometry()
         self.add_tag_to_cells(self.tag)
@@ -392,86 +393,59 @@ class DoubleShellUniverse(NIFUniverse):
     def _create_geometry(self) -> None:
         """Create the double-shell geometry"""
         # Compress geometry
-        self.fuel_radius = self.compress_dimension(self.fuel_radius_original)
-        pusher_radius = self.compress_dimension(self.pusher_radius_original)
-        tamper_radius = self.compress_dimension(self.tamper_radius_original)
-        foam_radius = self.compress_dimension(self.foam_radius_original)
-        ablator_radius = self.compress_dimension(self.ablator_radius_original)
-        
-        # Compress materials
-        pusher_material_compressed = self.materials.compress_density(self.pusher_material, self.tag, self.convergence_ratio)
-        tamper_material_compressed = self.materials.compress_density(self.tamper_material, self.tag, self.convergence_ratio)
-        foam_material_compressed = self.materials.compress_density(self.foam_material, self.tag, self.convergence_ratio)
-        ablator_material_compressed = self.materials.compress_density(self.ablator_material, self.tag, self.convergence_ratio)
+        pusher_radius, pusher_density = self.compress_dimension(self.pusher_radius_original, self.pusher_material)
+        tamper_radius, tamper_density = self.compress_dimension(self.tamper_radius_original, self.tamper_material)
+        foam_radius, foam_density = self.compress_dimension(self.foam_radius_original, self.foam_material)
         
         # Create surfaces
-        fuel_surface = openmc.Sphere(r=self.fuel_radius)
         pusher_surface = openmc.Sphere(r=pusher_radius)
         tamper_surface = openmc.Sphere(r=tamper_radius)
         foam_surface = openmc.Sphere(r=foam_radius)
-        ablator_surface = openmc.Sphere(r=ablator_radius, boundary_type='vacuum')
         
-        # Define outer region
-        self.outer_region = -ablator_surface
+        # Create regions
+        pusher_region = -pusher_surface & ~self.fuel_cell.region
+        tamper_region = -tamper_surface & +pusher_surface
+        foam_region = -foam_surface & +tamper_surface
+        
+        # Modify parent region(s)
+        self.ablator_cell.region &= +foam_surface
         
         # Create cells
-        # Fuel
-        self.fuel_cell = openmc.Cell(
-            name='fuel',
-            region=-fuel_surface,
-            fill=self.fuel_material_compressed
-        )
-        self.fuel_cell.volume = 4/3 * np.pi * self.fuel_radius**3
-        self.add_cell(self.fuel_cell)
-        
         # Pusher
         pusher_cell = openmc.Cell(
             name='pusher',
-            region=+fuel_surface & -pusher_surface,
-            fill=pusher_material_compressed
+            region=pusher_region,
+            fill=self.pusher_material
         )
-        self.add_cell(pusher_cell)
+        pusher_cell.density = pusher_density
         
         # Tamper
         tamper_cell = openmc.Cell(
             name='tamper',
-            region=+pusher_surface & -tamper_surface,
-            fill=tamper_material_compressed
+            region=tamper_region,
+            fill=self.tamper_material
         )
-        self.add_cell(tamper_cell)
+        tamper_cell.density = tamper_density
         
         # Foam
         foam_cell = openmc.Cell(
             name='foam',
-            region=+tamper_surface & -foam_surface,
-            fill=foam_material_compressed
+            region=foam_region,
+            fill=self.foam_material
         )
-        self.add_cell(foam_cell)
+        foam_cell.density = foam_density
         
-        # Ablator
-        ablator_cell = openmc.Cell(
-            name='ablator',
-            region=+foam_surface & -ablator_surface,
-            fill=ablator_material_compressed
-        )
-        self.add_cell(ablator_cell)
-        
-    def get_fuel_params(self) -> Tuple[float, openmc.Cell]:
-        return self.fuel_radius, self.fuel_cell
-    
-    def get_outer_region(self) -> openmc.Region:
-        return self.outer_region
+        self.add_cells([
+            pusher_cell,
+            tamper_cell,
+            foam_cell
+        ])
 
-class CoronalUniverse(NIFUniverse):
+class CoronalUniverse(BaseImplosionUniverse):
     """Coronal source target geometry"""
     
     def __init__(
         self,
-        capsule_radius_original: float = 0.1,
-        capsule_thickness_original: float = 0.01,
-        capsule_material: str = 'ch',
-        lining_thickness_original: Optional[float] = None,
-        lining_material: Optional[str] = None,
         ice_thickness_original: Optional[float] = None,
         ice_material: Optional[str] = None,
         hole_radius_original: float = 0.05,
@@ -482,12 +456,6 @@ class CoronalUniverse(NIFUniverse):
         
         Parameters:
         -----------
-        capsule_radius_original : float
-            Capsule radius in cm
-        capsule_thickness_original : float
-            Capsule thickness in cm
-        capsule_material : str
-            Name of capsule material
         lining_thickness_original : float, optional
             lining thickness in cm
         lining_material : str, optional
@@ -501,21 +469,16 @@ class CoronalUniverse(NIFUniverse):
         n_holes : int
             Number of laser entrance holes (1 or 2)
         **kwargs
-            Additional parameters for NIFUniverse
+            Additional parameters for BaseImplosionUniverse
         """
         super().__init__(**kwargs)
         
-        self.capsule_radius_original = capsule_radius_original
-        self.capsule_thickness_original = capsule_thickness_original
-        self.capsule_material = capsule_material
-        self.lining_thickness_original = lining_thickness_original or 0.0
-        self.lining_material = lining_material
         self.ice_thickness_original = ice_thickness_original or 0.0
-        self.ice_material = ice_material
+        self.ice_material = self.materials[ice_material]
         self.hole_radius_original = hole_radius_original
         self.n_holes = n_holes
         
-        if self.hole_radius_original >= self.capsule_radius_original:
+        if self.hole_radius_original >= self.fuel_radius_original + self.ablator_thickness_original:
             raise ValueError("Hole radius must be less than capsule radius")
         
         self._create_geometry()
@@ -524,111 +487,142 @@ class CoronalUniverse(NIFUniverse):
     def _create_geometry(self) -> None:
         """Create the coronal source geometry"""
         # Compress geometry
-        capsule_radius = self.compress_dimension(self.capsule_radius_original)
-        capsule_thickness = self.compress_dimension(self.capsule_thickness_original)
-        lining_thickness = self.compress_dimension(self.lining_thickness_original)
-        ice_thickness = self.compress_dimension(self.ice_thickness_original)
-        hole_radius = self.compress_dimension(self.hole_radius_original)
-        
-        # Compress materials
-        capsule_material_compressed = self.materials.compress_density(self.capsule_material, self.tag, self.convergence_ratio)
-        
-        # Define fuel radius
-        self.fuel_radius = capsule_radius - capsule_thickness - lining_thickness - ice_thickness
+        ice_thickness, ice_density = self.compress_dimension(self.ice_thickness_original, self.ice_material)
+        self.hole_radius, _ = self.compress_dimension(self.hole_radius_original) # density not needed for hole
         
         # Create surfaces
-        fuel_surface = openmc.Sphere(r=self.fuel_radius)
-        capsule_surface = openmc.Sphere(r=capsule_radius, boundary_type='vacuum')            
-        
+        self.capsule_radius = self.fuel_radius + self.ablator_thickness + ice_thickness
         # Laser entrance hole (plane)
-        z_loc = -np.sqrt(capsule_radius**2 - hole_radius**2) # negative z location to point hole upwards
+        z_loc = -np.sqrt(self.capsule_radius**2 - self.hole_radius**2) # negative z location to point hole upwards
         hole1_plane = openmc.ZPlane(z0=z_loc, boundary_type='vacuum')
         
         # Regions
-        fuel_region = -fuel_surface & +hole1_plane
-        capsule_region = -capsule_surface & +fuel_surface & +hole1_plane
-        self.outer_region = -capsule_surface & +hole1_plane
+        self.fuel_cell.region &= +hole1_plane
+        self.ablator_cell.region &= +hole1_plane
         
-        # Cells
-        self.fuel_cell = openmc.Cell(
-            name='fuel',
-            region=fuel_region,
-            fill=self.fuel_material_compressed
-        )
-        # Calculate the volume of fuel cell
+        # Redefine outer_region
+        self.outer_region &= +hole1_plane
+        
+        # Recalculate the volume of fuel cell
         cap_height = self.fuel_radius + z_loc
         cap_volume = np.pi / 3 * cap_height**2 * (3 * self.fuel_radius - cap_height)
         self.fuel_cell.volume = 4 / 3 * np.pi * self.fuel_radius**3 - cap_volume
-        self.add_cell(self.fuel_cell)
         
-        capsule_cell = openmc.Cell(
-            name='capsule',
-            region=capsule_region,
-            fill=capsule_material_compressed
-        )
-        self.add_cell(capsule_cell)
-        
-        ### OPTIONAL FEATURES ###
-        if self.lining_thickness_original > 0.0 and self.lining_material:
-            # Compress material
-            lining_material_compressed = self.materials.compress_density(self.lining_material, self.tag, self.convergence_ratio)
-            # Construct geometry
-            lining_radius = capsule_radius - capsule_thickness
-            lining_surface = openmc.Sphere(r=lining_radius)
-            lining_region = -lining_surface & +fuel_surface & +hole1_plane
-            lining_cell = openmc.Cell(
-                name='lining',
-                region=lining_region,
-                fill=lining_material_compressed
-            )
-            self.add_cell(lining_cell)
-            
-            # Remove lining from other regions
-            capsule_cell.region &= +lining_surface
-            
+        ### OPTIONAL FEATURES ###           
         if ice_thickness > 0.0 and self.ice_material:
-            # Compress material
-            ice_material_compressed = self.materials.compress_density(self.ice_material, self.tag, self.convergence_ratio)
             # Construct geometry
-            ice_radius = capsule_radius - capsule_thickness - lining_thickness
-            ice_surface = openmc.Sphere(r=ice_radius)
-            ice_region = -ice_surface & +fuel_surface & +hole1_plane
+            ice_outer_radius = self.fuel_radius + ice_thickness
+            ice_outer_surface = openmc.Sphere(r=ice_outer_radius)
+            ice_region = -ice_outer_surface & ~self.fuel_cell.region & +hole1_plane
             ice_cell = openmc.Cell(
                 name='ice',
                 region=ice_region,
-                fill=ice_material_compressed
+                fill=self.ice_material
             )
+            ice_cell.density = ice_density
             self.add_cell(ice_cell)
             
             # Remove ice from other regions
-            capsule_cell.region &= +ice_surface
-            if self.lining_thickness_original > 0.0:
-                lining_cell.region &= +ice_surface
+            self.ablator_cell.region &= +ice_outer_surface
                     
         if self.n_holes == 2:
             hole2_plane = openmc.ZPlane(z0=-z_loc, boundary_type='vacuum')
             
             self.fuel_cell.region &= -hole2_plane
-            capsule_cell.region &= -hole2_plane
-            if self.lining_thickness_original > 0.0:
-                lining_cell.region &= -hole2_plane
-            if self.ice_thickness_original > 0.0:
+            self.ablator_cell.region &= -hole2_plane
+            if ice_thickness > 0.0:
                 ice_cell.region &= -hole2_plane
                 
             # Add constraint to outer region
             self.outer_region &= -hole2_plane
-                
-    def get_fuel_params(self) -> Tuple[float, openmc.Cell]:
-        return self.fuel_radius, self.fuel_cell
-    
-    def get_outer_region(self) -> openmc.Region:
-        return self.outer_region
-                
-class DualSourceUniverse(NIFUniverse):
+            
+class NuclearReactionVesselUniverse(BaseImplosionUniverse):
     def __init__(
         self,
-        primary_geom: NIFUniverse,
-        secondary_geom: NIFUniverse,
+        cone_length: float = 7.5,
+        small_diameter: float = 0.9,
+        large_diameter: float = 4.0,
+        wall_thickness: float = 0.1,
+        distance_from_source: float = 9.0,
+        nrv_material: str = 'aluminum',
+        nrv_fill_material: Optional[str] = None,
+        **kwargs):
+        """
+        Initialize nuclear reaction vessel geometry. Details of NRV can be found here https://doi.org/10.1016/j.nima.2018.01.072
+        
+        Parameters:
+        -----------
+        cone_length : float
+            Length of cone in cm
+        small_diameter : float
+            Small diameter of cone in cm
+        large_diameter : float
+            Large diameter of cone in cm
+        wall_thickness : float
+            Wall thickness in cm
+        distance_from_source : float
+            Distance from source in cm
+        nrv_material : str
+            Name of nrv material
+        nrv_fill_material : str, optional
+            Name of nrv fill material
+        **kwargs
+            Additional parameters for BaseImplosionUniverse
+        """
+        super().__init__(**kwargs)
+        
+        self.cone_length = cone_length
+        self.small_diameter = small_diameter
+        self.large_diameter = large_diameter
+        self.wall_thickness = wall_thickness
+        self.distance_from_source = distance_from_source
+        self.nrv_material = self.materials[nrv_material]
+        self.nrv_fill_material = self.materials[nrv_fill_material]
+        
+        self.remove_vacuum_boundaries()
+        self._create_geometry()
+        self.add_tag_to_cells(self.tag)
+        
+    def _create_geometry(self) -> None:
+        # Create surfaces
+        nrv_outer_cone = ConicalFrustum(
+            center_base=(self.distance_from_source, 0, 0),
+            axis=(self.cone_length, 0, 0),
+            r1=self.small_diameter / 2,
+            r2=self.large_diameter / 2,
+        )
+        nrv_inner_cone = ConicalFrustum(
+            center_base=(self.distance_from_source + self.wall_thickness, 0, 0),
+            axis=(self.cone_length - 2 * self.wall_thickness, 0, 0),
+            r1=self.small_diameter / 2 - self.wall_thickness,
+            r2=self.large_diameter / 2 - self.wall_thickness,
+        )
+        
+        # Regions
+        nrv_wall_region = -nrv_inner_cone & +nrv_outer_cone
+        nrv_fill_region = -nrv_inner_cone
+        
+        # Cells
+        nrv_wall_cell = openmc.Cell(
+            name='nrv_wall',
+            region=nrv_wall_region,
+            fill=self.nrv_material,
+        )
+        self.add_cell(nrv_wall_cell)
+        
+        if self.nrv_fill_material:
+            nrv_fill_cell = openmc.Cell(
+                name='nrv_fill',
+                region=nrv_fill_region,
+                fill=self.nrv_fill_material,
+            )
+            self.add_cell(nrv_fill_cell)
+                
+class DualSourceUniverse(BaseImplosionUniverse):
+    def __init__(
+        self,
+        primary_geom: BaseImplosionUniverse,
+        secondary_geom: BaseImplosionUniverse,
         center_distance: float = 0.5,
         moderator_radius: float = 1.0,
         moderator_thickness: Union[float, Sequence[float]] = 0.1,
@@ -642,9 +636,9 @@ class DualSourceUniverse(NIFUniverse):
         
         Parameters:
         -----------
-        primary_geom : NIFUniverse
+        primary_geom : BaseImplosionUniverse
             Primary source geometry
-        secondary_geom : NIFUniverse
+        secondary_geom : BaseImplosionUniverse
             Secondary source geometry
         center_distance : float
             Distance between source centers in cm
@@ -671,12 +665,12 @@ class DualSourceUniverse(NIFUniverse):
         # Handle if moderator is iterable vs not
         if isinstance(moderator_thickness, float) and isinstance(moderator_material, str):
             self.moderator_thickness = [moderator_thickness]
-            self.moderator_material = [moderator_material]
+            self.moderator_material = [self.materials[moderator_material]]
         elif isinstance(moderator_thickness, Sequence) and isinstance(moderator_material, Sequence) and not isinstance(moderator_material, str):
             if len(moderator_thickness) != len(moderator_material):
                 raise ValueError("Moderator thickness and material must be the same length")
             self.moderator_thickness = moderator_thickness
-            self.moderator_material = moderator_material
+            self.moderator_material = [self.materials[mat] for mat in moderator_material]
         else:
             raise ValueError("Moderator thickness and material must be the same type")
         
@@ -777,7 +771,7 @@ class DualSourceUniverse(NIFUniverse):
             moderator_cell = openmc.Cell(
                 name=f'moderator_cell_{i}',
                 region=moderator_region,
-                fill=self.materials[material]
+                fill=material
             )
             self.add_cell(moderator_cell)
             
@@ -818,12 +812,6 @@ class DualSourceUniverse(NIFUniverse):
             region=vacuum_region
         )
         self.add_cell(vacuum_cell)
-        
-    def get_outer_region(self) -> openmc.Region:
-        return self.outer_region
-    
-    def get_fuel_params(self) -> Tuple[Tuple[float, openmc.Cell], Tuple[float, openmc.Cell]]:
-        return self.primary_geom.get_fuel_params(), self.secondary_geom.get_fuel_params()
     
 class DualFilledHohlraum(DualSourceUniverse):
     """
@@ -884,33 +872,33 @@ class DualFilledHohlraum(DualSourceUniverse):
         self.primary_coronal = primary_coronal
         self.secondary_coronal = secondary_coronal
         self.hohlraum_inner_radius = hohlraum_inner_radius
-        self.hohlraum_material = hohlraum_material
+        self.hohlraum_material = self.materials[hohlraum_material]
         self.hohlraum_wall_thickness = hohlraum_wall_thickness
         self.layered_moderator_primary_gap = layered_moderator_primary_gap
         self.hohlraum_lining_thickness = hohlraum_lining_thickness
-        self.hohlraum_lining_material = hohlraum_lining_material
+        self.hohlraum_lining_material = self.materials[hohlraum_lining_material]
         
         # Handle if layered moderator is iterable vs not
         if layered_moderator_material and layered_moderator_thickness:
             if isinstance(layered_moderator_thickness, float) and isinstance(layered_moderator_material, str):
                 self.layered_moderator_thickness = [layered_moderator_thickness]
-                self.layered_moderator_material = [layered_moderator_material]
+                self.layered_moderator_material = [self.materials[layered_moderator_material]]
             elif isinstance(layered_moderator_thickness, Sequence) and isinstance(layered_moderator_material, Sequence) and not isinstance(layered_moderator_material, str):
                 if len(layered_moderator_thickness) != len(layered_moderator_material):
                     raise ValueError("Moderator thickness and material must be the same length")
                 self.layered_moderator_thickness = layered_moderator_thickness
-                self.layered_moderator_material = layered_moderator_material
+                self.layered_moderator_material = [self.materials[mat] for mat in layered_moderator_material]
             else:
                 raise ValueError("Moderator thickness and material must be the same type")
         
         # Calculate center distance based on source size and gap
-        self.primary_radius = primary_coronal.capsule_radius_original
-        secondary_radius = secondary_coronal.capsule_radius_original
+        self.primary_radius = primary_coronal.capsule_radius
+        secondary_radius = secondary_coronal.capsule_radius
         center_distance = self.primary_radius + secondary_radius + source_gap
         
         # Calculate moderator thickness based on distance between flats of LEH
-        primary_LEH_z = np.sqrt(self.primary_radius**2 - primary_coronal.hole_radius_original**2)
-        secondary_LEH_z = np.sqrt(secondary_radius**2 - secondary_coronal.hole_radius_original**2)
+        primary_LEH_z = np.sqrt(self.primary_radius**2 - primary_coronal.hole_radius**2)
+        secondary_LEH_z = np.sqrt(secondary_radius**2 - secondary_coronal.hole_radius**2)
         self.fill_length = primary_LEH_z + secondary_LEH_z + center_distance
         
         # Initialize parent class
@@ -942,8 +930,8 @@ class DualFilledHohlraum(DualSourceUniverse):
         
         # Calculate surfaces for hohlraum
         hohlraum_outer_cylinder = openmc.ZCylinder(r=self.hohlraum_inner_radius + self.hohlraum_wall_thickness)
-        primary_LEH_cylinder = openmc.ZCylinder(r=self.primary_coronal.hole_radius_original)
-        secondary_LEH_cylinder = openmc.ZCylinder(r=self.secondary_coronal.hole_radius_original)
+        primary_LEH_cylinder = openmc.ZCylinder(r=self.primary_coronal.hole_radius)
+        secondary_LEH_cylinder = openmc.ZCylinder(r=self.secondary_coronal.hole_radius)
         hohlraum_bottom = openmc.ZPlane(z0=-(self.fill_length/2 + self.hohlraum_wall_thickness))
         hohlraum_top = openmc.ZPlane(z0=self.fill_length/2 + self.hohlraum_wall_thickness)
         moderator_bottom = self.moderator_planes[0]
@@ -967,7 +955,7 @@ class DualFilledHohlraum(DualSourceUniverse):
         hohlraum_cell = openmc.Cell(
             name='hohlraum',
             region=hohlraum_region,
-            fill=self.materials[self.hohlraum_material]
+            fill=self.hohlraum_material
         )
         self.add_cell(hohlraum_cell)
         
@@ -995,7 +983,7 @@ class DualFilledHohlraum(DualSourceUniverse):
             hohlraum_lining_cell = openmc.Cell(
                 name='hohlraum_lining',
                 region=hohlraum_lining_region,
-                fill=self.materials[self.hohlraum_lining_material]
+                fill=self.hohlraum_lining_material
             )
             self.add_cell(hohlraum_lining_cell)
             
@@ -1024,7 +1012,7 @@ class DualFilledHohlraum(DualSourceUniverse):
                 moderator_cell = openmc.Cell(
                     name=f'layered_moderator_cell_{i}',
                     region=moderator_region,
-                    fill=self.materials[material]
+                    fill=material
                 )
                 self.add_cell(moderator_cell)
                 
@@ -1051,9 +1039,6 @@ class DualFilledHohlraum(DualSourceUniverse):
             region=vacuum_region
         )
         self.add_cell(vacuum_cell)
-            
-    def get_outer_region(self) -> openmc.Region:
-        return self.outer_region
     
 class DualHohlraumCoronal(DualSourceUniverse):
     """
@@ -1062,7 +1047,7 @@ class DualHohlraumCoronal(DualSourceUniverse):
     """
     def __init__(
         self,
-        primary_hohlraum: StandardNIFUniverse,
+        primary_hohlraum: IndirectDriveUniverse,
         secondary_coronal: CoronalUniverse,
         moderator_thickness: Union[float, Sequence[float]] = 0.6,
         moderator_material: Union[str, Sequence[str]] = 'ch2',
@@ -1075,7 +1060,7 @@ class DualHohlraumCoronal(DualSourceUniverse):
         
         Parameters:
         -----------
-        primary_hohlraum : StandardNIFUniverse
+        primary_hohlraum : IndirectDriveUniverse
             Primary hohlraum source geometry
         secondary_coronal : CoronalUniverse
             Secondary coronal source geometry
@@ -1095,15 +1080,13 @@ class DualHohlraumCoronal(DualSourceUniverse):
         else:
             self.total_thickness = np.sum(moderator_thickness)
         self.reflector_thickness = reflector_thickness
-        self.reflector_material = reflector_material
         
         # Calculate distances
-        secondary_LEH_z = np.sqrt(secondary_coronal.capsule_radius_original**2 - secondary_coronal.hole_radius_original**2)
+        secondary_LEH_z = np.sqrt(secondary_coronal.capsule_radius**2 - secondary_coronal.hole_radius**2)
         center_distance = primary_hohlraum.hohlraum_radius + self.total_thickness - secondary_LEH_z
         moderator_distance = primary_hohlraum.hohlraum_radius + self.total_thickness/2
         
         # Initialize parent class
-        # We'll override _create_geometry to build our specialized version
         # TODO: Am I getting the compression ratio correct?
         super().__init__(
             primary_geom=primary_hohlraum,
@@ -1116,6 +1099,9 @@ class DualHohlraumCoronal(DualSourceUniverse):
             secondary_orientation='perpendicular',
             **kwargs
         )
+        
+        # Need to wait for parent init to complete to access materials
+        self.reflector_material = self.materials[reflector_material]
         
         # Remove vacuum boundary conditions from parent class
         self.remove_vacuum_boundaries()
@@ -1135,7 +1121,7 @@ class DualHohlraumCoronal(DualSourceUniverse):
         reflector_top = self.moderator_planes[0]
         reflector_bottom_inside = self.moderator_planes[-1]
         reflector_bottom_outside = openmc.XPlane(self.total_thickness / 2 + self.reflector_thickness)
-        secondary_LEH_cylinder = openmc.XCylinder(r=self.secondary_coronal.hole_radius_original)
+        secondary_LEH_cylinder = openmc.XCylinder(r=self.secondary_coronal.hole_radius)
         
         reflector_wall_region = -reflector_outer_cylinder & +self.moderator_cyl & +reflector_top & -reflector_bottom_inside
         reflector_base_region = -reflector_outer_cylinder & +secondary_LEH_cylinder & +reflector_bottom_inside & -reflector_bottom_outside
@@ -1148,7 +1134,7 @@ class DualHohlraumCoronal(DualSourceUniverse):
         reflector_cell = openmc.Cell(
             name='reflector_cell',
             region=reflector_region,
-            fill=self.materials[self.reflector_material]
+            fill=self.reflector_material
         )
         self.add_cell(reflector_cell)
             
@@ -1157,7 +1143,7 @@ class DualHohlraumCoronal(DualSourceUniverse):
         multiplier = 1.1
         vacuum_box = BOX(
             xmin=(self.primary_translation - self.primary_hohlraum.hohlraum_radius) * multiplier,
-            xmax=(self.secondary_translation + self.secondary_coronal.capsule_radius_original + self.reflector_thickness) * multiplier,
+            xmax=(self.secondary_translation + self.secondary_coronal.capsule_radius + self.reflector_thickness) * multiplier,
             ymin=-reflector_radius * multiplier,
             ymax=reflector_radius * multiplier,
             zmin=-reflector_radius * multiplier,
@@ -1172,6 +1158,3 @@ class DualHohlraumCoronal(DualSourceUniverse):
             fill=None
         )
         self.add_cell(vacuum_cell)
-    
-    def get_outer_region(self) -> openmc.Region:
-        return self.outer_region
