@@ -60,7 +60,7 @@ class NIFSimulation:
     
     def setup_simulation(
         self,
-        geometry_type: Literal['indirect', 'double_shell', 'coronal', 'nrv', 'dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal'] = 'indirect',
+        geometry_type: Literal['indirect', 'double_shell', 'coronal', 'niv', 'dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal'] = 'indirect',
         # Simulation parameters
         batches: int = 100,
         particles_per_batch: int = int(1e5),
@@ -78,7 +78,7 @@ class NIFSimulation:
         Parameters:
         -----------
         geometry_type : str
-            Geometry type, one of ['indirect', 'double_shell', 'coronal', 'nrv', 'dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal']
+            Geometry type, one of ['indirect', 'double_shell', 'coronal', 'niv', 'dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal']
         batches : int
             Number of batches
         particles_per_batch : int
@@ -203,15 +203,15 @@ class NIFSimulation:
             fuel_radius, fuel_cell = universe.get_fuel_params()
             fuel_radius_compressed = fuel_radius / universe.convergence_ratio
             
-            # If using NRV, set azimuthal angle for source
-            if isinstance(universe, NuclearReactionVesselUniverse):
+            # If using NIV, set azimuthal angle for source
+            if isinstance(universe, NuclearInteractionVesselUniverse):
                 source_kwargs = source_kwargs or {}
                 source_kwargs['angle'] = stats.PolarAzimuthal(
                     mu=stats.Uniform(a=0, b=universe.cos_cone_angle),
                     phi=stats.Uniform(a=0, b=2*np.pi),
                     reference_vwu=(1.0, 0, 0)
                 )
-                # Need to set source strength to account for solid angle subtended by NRV
+                # Need to set source strength to account for solid angle subtended by NIV
                 source_kwargs['strength'] = universe.solid_angle / (4 * np.pi)
             
             # Create source
@@ -232,7 +232,7 @@ class NIFSimulation:
         # Create tallies
         tallies = NIFTallies(geometry=geometry)
         # Determine cell for tallying
-        if isinstance(universe, NuclearReactionVesselUniverse):
+        if isinstance(universe, NuclearInteractionVesselUniverse):
             cells = universe.tally_cells
             partial_current_surfaces = [universe.tally_partial_current_surfaces]
             track_nuclides = universe.tally_nuclides
@@ -293,7 +293,7 @@ class NIFSimulation:
     
     def _setup_geometry(
         self,
-        geometry_type: Literal['indirect', 'double_shell', 'coronal', 'nrv'],
+        geometry_type: Literal['indirect', 'double_shell', 'coronal', 'niv'],
         materials: NIFMaterials,
         convergence_ratio: float,
         tag: Literal['primary', 'secondary'] = 'primary',
@@ -304,7 +304,7 @@ class NIFSimulation:
         
         Parameters:
         geometry_type : str
-            Geometry type, one of ['indirect', 'double_shell', 'coronal', 'nrv']
+            Geometry type, one of ['indirect', 'double_shell', 'coronal', 'niv']
         materials : NIFMaterials
             Material database
         convergence_ratio : float
@@ -343,8 +343,8 @@ class NIFSimulation:
                 **kwargs or {}
             )
             
-        elif geometry_type == 'nrv':
-            return NuclearReactionVesselUniverse(
+        elif geometry_type == 'niv':
+            return NuclearInteractionVesselUniverse(
                 materials=materials,
                 convergence_ratio=convergence_ratio,
                 tag=tag,
@@ -352,7 +352,7 @@ class NIFSimulation:
             )
             
         else:
-            raise ValueError(f"Invalid geometry type: {geometry_type}. Options are ['indirect', 'double_shell', 'coronal', 'nrv'].")
+            raise ValueError(f"Invalid geometry type: {geometry_type}. Options are ['indirect', 'double_shell', 'coronal', 'niv'].")
         
     def _setup_dual_source_geometry(
         self,

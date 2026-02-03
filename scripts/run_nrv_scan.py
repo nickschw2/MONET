@@ -11,17 +11,17 @@ import numpy as np
 if __name__ == "__main__":
     print("Setting up NIF simulation...")
     # Create and run simulation
-    sim = NIFSimulation(output_dir='data/nrv_scan')
+    sim = NIFSimulation(output_dir='data/niv_scan')
     source_kwargs = {'pulse_fwhm': 100e-12}
     
-    # Scan a number of NRV configurations
+    # Scan a number of NIV configurations
     geometry_parameters = [
-        {'nrv_fill_thickness': [7.3], 'nrv_fill_material': [None]},
-        {'nrv_fill_thickness': [7.3], 'nrv_fill_material': ['ch2']},
-        {'nrv_fill_thickness': [7.3], 'nrv_fill_material': ['steel']},
-        {'nrv_fill_thickness': [7.3], 'nrv_fill_material': ['graphite']},
-        {'nrv_fill_thickness': [7.3], 'nrv_fill_material': ['lithium_hydride']},
-        {'nrv_fill_thickness': [7.3], 'nrv_fill_material': ['zirconium_hydride']},
+        {'niv_fill_thickness': [7.3], 'niv_fill_material': [None]},
+        {'niv_fill_thickness': [7.3], 'niv_fill_material': ['ch2']},
+        {'niv_fill_thickness': [7.3], 'niv_fill_material': ['steel']},
+        {'niv_fill_thickness': [7.3], 'niv_fill_material': ['graphite']},
+        {'niv_fill_thickness': [7.3], 'niv_fill_material': ['lithium_hydride']},
+        {'niv_fill_thickness': [7.3], 'niv_fill_material': ['zirconium_hydride']},
     ]
     
     # Create figure for partial current
@@ -32,14 +32,14 @@ if __name__ == "__main__":
     for i, geometry_kwargs in enumerate(geometry_parameters):
         print(f"Running simulation {i+1}/{len(geometry_parameters)}...")
         model = sim.setup_simulation(
-            geometry_type='nrv',
+            geometry_type='niv',
             convergence_ratio=5.0,
             source_kwargs=source_kwargs,
             geometry_kwargs=geometry_kwargs,
             fuel_fraction=0.0, # DD fuel
             particles_per_batch=int(1e6)
         )
-        run_dir = sim.run_simulation(model=model, run_name=f'nrv_{i}', reset=False)
+        run_dir = sim.run_simulation(model=model, run_name=f'niv_{i}', reset=False)
         print(f"Simulation completed. Results in: {run_dir}")
         
         # Add processor to list
@@ -52,10 +52,10 @@ if __name__ == "__main__":
         std = tally_df['std. dev.']  # neutrons/source
         
         # Plot partial current
-        if geometry_kwargs['nrv_fill_material'][0] is None:
+        if geometry_kwargs['niv_fill_material'][0] is None:
             label = "Vacuum"
         else:
-            label = f"{geometry_kwargs['nrv_fill_material'][0]}"
+            label = f"{geometry_kwargs['niv_fill_material'][0]}"
         ax.step(energy, partial_current, label=label)
         
         # Plot std dev as shaded region
@@ -108,5 +108,5 @@ if __name__ == "__main__":
     labelLines(ax2.get_lines(), align=False, fontsize=20)
     
     # Save figures
-    fig.savefig(f'{sim.output_dir}/nrv_scan_partial_current.png', dpi=300)
-    fig2.savefig(f'{sim.output_dir}/nrv_scan_cumulative_partial_current.png', dpi=300)
+    fig.savefig(f'{sim.output_dir}/niv_scan_partial_current.png', dpi=300)
+    fig2.savefig(f'{sim.output_dir}/niv_scan_cumulative_partial_current.png', dpi=300)

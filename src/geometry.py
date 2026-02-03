@@ -541,7 +541,7 @@ class CoronalUniverse(BaseImplosionUniverse):
             # Subtract second hole volume from fuel cell
             self.fuel_cell.volume -= cap_volume
             
-class NuclearReactionVesselUniverse(BaseImplosionUniverse):
+class NuclearInteractionVesselUniverse(BaseImplosionUniverse):
     def __init__(
         self,
         cone_length: float = 7.5,
@@ -549,15 +549,15 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         large_diameter: float = 4.0,
         wall_thickness: float = 0.1,
         distance_from_source: float = 9.0,
-        nrv_wall_material: str = 'aluminum',
-        nrv_fill_thickness: Optional[Union[float, Sequence[float]]] = None,
-        nrv_fill_material: Optional[Union[str, Sequence[str]]] = None,
+        niv_wall_material: str = 'aluminum',
+        niv_fill_thickness: Optional[Union[float, Sequence[float]]] = None,
+        niv_fill_material: Optional[Union[str, Sequence[str]]] = None,
         tally_nuclides: Optional[Union[str, Sequence[str]]] = None,
         tally_reactions: Optional[Union[str, Sequence[str]]] = None,
         no_shielding: bool = False,
         **kwargs):
         """
-        Initialize nuclear reaction vessel geometry. Details of NRV can be found here https://doi.org/10.1016/j.nima.2018.01.072
+        Initialize nuclear interaction vessel geometry. Details of NIV can be found here https://doi.org/10.1016/j.nima.2018.01.072
         
         Parameters:
         -----------
@@ -571,12 +571,12 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
             Wall thickness in cm
         distance_from_source : float
             Distance from source in cm
-        nrv_wall_material : str
-            Name of nrv material
-        nrv_fill_thickness : float, optional
-            Thickness(es) of nrv fill, should sum to `cone_length - 2 * wall_thickness` if provided
-        nrv_fill_material : str, optional
-            Name of nrv fill material(s)
+        niv_wall_material : str
+            Name of niv material
+        niv_fill_thickness : float, optional
+            Thickness(es) of niv fill, should sum to `cone_length - 2 * wall_thickness` if provided
+        niv_fill_material : str, optional
+            Name of niv fill material(s)
         tally_nuclides : str, optional
             Nuclide to tally
         tally_reactions : str, optional
@@ -593,24 +593,24 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         self.large_radius = large_diameter / 2
         self.wall_thickness = wall_thickness
         self.distance_from_source = distance_from_source
-        self.nrv_wall_material = self.materials[nrv_wall_material]
+        self.niv_wall_material = self.materials[niv_wall_material]
         
         # Find solid angle of cone for later use
         self.cos_cone_angle = (self.distance_from_source + self.cone_length) / np.sqrt((self.distance_from_source + self.cone_length)**2 + self.large_radius**2)
         self.solid_angle = 2 * np.pi * (1 - self.cos_cone_angle)
         
-        # Handle if nrv fill is iterable vs not
-        if isinstance(nrv_fill_thickness, float) and isinstance(nrv_fill_material, str):
-            self.nrv_fill_thickness = [nrv_fill_thickness]
-            self.nrv_fill_material = [self.materials[nrv_fill_material]]
-        elif isinstance(nrv_fill_thickness, Sequence) and isinstance(nrv_fill_material, Sequence) and not isinstance(nrv_fill_material, str):
-            if len(nrv_fill_thickness) != len(nrv_fill_thickness):
+        # Handle if niv fill is iterable vs not
+        if isinstance(niv_fill_thickness, float) and isinstance(niv_fill_material, str):
+            self.niv_fill_thickness = [niv_fill_thickness]
+            self.niv_fill_material = [self.materials[niv_fill_material]]
+        elif isinstance(niv_fill_thickness, Sequence) and isinstance(niv_fill_material, Sequence) and not isinstance(niv_fill_material, str):
+            if len(niv_fill_thickness) != len(niv_fill_thickness):
                 raise ValueError("Fill thicknesses and materials must be the same length")
-            self.nrv_fill_thickness = nrv_fill_thickness
-            self.nrv_fill_material = [self.materials[mat] for mat in nrv_fill_material]
-        elif nrv_fill_thickness is None and nrv_fill_material is None:
-            self.nrv_fill_thickness = nrv_fill_thickness
-            self.nrv_fill_material = nrv_fill_material
+            self.niv_fill_thickness = niv_fill_thickness
+            self.niv_fill_material = [self.materials[mat] for mat in niv_fill_material]
+        elif niv_fill_thickness is None and niv_fill_material is None:
+            self.niv_fill_thickness = niv_fill_thickness
+            self.niv_fill_material = niv_fill_material
         else:
             raise ValueError("Fill thickness and material must be the same type")
         
@@ -632,8 +632,8 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         self.no_shielding = no_shielding
         
         # If total thickness is not equal to cone length - 2 * wall_thickness, raise error
-        if self.nrv_fill_thickness:
-            total_fill_thickness = np.sum(self.nrv_fill_thickness)
+        if self.niv_fill_thickness:
+            total_fill_thickness = np.sum(self.niv_fill_thickness)
             expected_thickness = self.cone_length - 2 * self.wall_thickness
             if total_fill_thickness != expected_thickness:
                 raise ValueError(f"Total fill thickness {total_fill_thickness} does not equal expected thickness {expected_thickness}")
@@ -646,14 +646,14 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         slope = (self.large_radius - self.small_radius) / self.cone_length
         apex_outer = self.distance_from_source - self.small_radius / slope
         apex_inner = apex_outer + self.wall_thickness / (slope / np.sqrt(1 + slope**2))  # Trig to find inner apex location
-        nrv_outer_cone = openmc.XCone(x0=apex_outer, r2=slope**2)
-        nrv_inner_cone = openmc.XCone(x0=apex_inner, r2=slope**2)
+        niv_outer_cone = openmc.XCone(x0=apex_outer, r2=slope**2)
+        niv_inner_cone = openmc.XCone(x0=apex_inner, r2=slope**2)
         outer_bottom_plane = openmc.XPlane(x0=self.distance_from_source)
         outer_top_plane = openmc.XPlane(x0=self.distance_from_source + self.cone_length)
         
-        # Create nrv_fill stack
+        # Create niv_fill stack
         # Create planes
-        self.nrv_fill_planes = [
+        self.niv_fill_planes = [
             openmc.XPlane(x0=self.distance_from_source + self.wall_thickness), # start at beginning of fill region
             openmc.XPlane(x0=self.distance_from_source + self.cone_length - self.wall_thickness) # end at end of fill region
         ]
@@ -665,20 +665,20 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         outer_zmax_plane = openmc.ZPlane(z0=self.large_radius)
         perpendicular_boundary_region = +outer_ymin_plane & -outer_ymax_plane & +outer_zmin_plane & -outer_zmax_plane
         
-        total_nrv_fill_region = -nrv_inner_cone & +self.nrv_fill_planes[0] & -self.nrv_fill_planes[-1] & perpendicular_boundary_region
+        total_niv_fill_region = -niv_inner_cone & +self.niv_fill_planes[0] & -self.niv_fill_planes[-1] & perpendicular_boundary_region
         
-        # Add nrv_fill planes
-        if self.nrv_fill_material and self.nrv_fill_thickness:
-            for i in range(len(self.nrv_fill_thickness) - 1):
-                self.nrv_fill_planes.insert(
+        # Add niv_fill planes
+        if self.niv_fill_material and self.niv_fill_thickness:
+            for i in range(len(self.niv_fill_thickness) - 1):
+                self.niv_fill_planes.insert(
                     i + 1,
-                    openmc.XPlane(self.distance_from_source + self.wall_thickness + np.sum(self.nrv_fill_thickness[:i+1]))
+                    openmc.XPlane(self.distance_from_source + self.wall_thickness + np.sum(self.niv_fill_thickness[:i+1]))
                 )
                 
-            # Create nrv_fill cells
+            # Create niv_fill cells
             self.tally_cells = []
-            for i, material in enumerate(self.nrv_fill_material):
-                nrv_fill_region = -nrv_inner_cone & +self.nrv_fill_planes[i] & -self.nrv_fill_planes[i+1] & perpendicular_boundary_region
+            for i, material in enumerate(self.niv_fill_material):
+                niv_fill_region = -niv_inner_cone & +self.niv_fill_planes[i] & -self.niv_fill_planes[i+1] & perpendicular_boundary_region
 
                 # Check if this material contains a tally nuclide
                 contains_tally_nuclide = self.tally_nuclides and material and any(nuclide in material.get_nuclides() for nuclide in self.tally_nuclides)
@@ -689,25 +689,25 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
                 else:
                     fill_material = material
 
-                nrv_fill_cell = openmc.Cell(
-                    name=f'nrv_fill_cell_{i}',
-                    region=nrv_fill_region,
+                niv_fill_cell = openmc.Cell(
+                    name=f'niv_fill_cell_{i}',
+                    region=niv_fill_region,
                     fill=fill_material
                 )
-                self.add_cell(nrv_fill_cell)
+                self.add_cell(niv_fill_cell)
                 
                 # Set volume of cell
-                r1 = slope * (self.nrv_fill_planes[i].x0 - apex_inner)
-                r2 = slope * (self.nrv_fill_planes[i+1].x0 - apex_inner)
-                nrv_fill_cell.volume = (1/3) * np.pi * self.nrv_fill_thickness[i] * (r1**2 + r1 * r2 + r2**2)
+                r1 = slope * (self.niv_fill_planes[i].x0 - apex_inner)
+                r2 = slope * (self.niv_fill_planes[i+1].x0 - apex_inner)
+                niv_fill_cell.volume = (1/3) * np.pi * self.niv_fill_thickness[i] * (r1**2 + r1 * r2 + r2**2)
 
                 # Store the cell for tallying if it contains a tally nuclide
                 if contains_tally_nuclide:
-                    self.tally_cells.append(nrv_fill_cell)
+                    self.tally_cells.append(niv_fill_cell)
         
         # Create wall region
-        nrv_outer_region = -nrv_outer_cone & +outer_bottom_plane & -outer_top_plane & perpendicular_boundary_region
-        nrv_wall_region = nrv_outer_region & ~total_nrv_fill_region
+        niv_outer_region = -niv_outer_cone & +outer_bottom_plane & -outer_top_plane & perpendicular_boundary_region
+        niv_wall_region = niv_outer_region & ~total_niv_fill_region
         
         # Extend vacuum boundary slightly
         epsilon = 1e-3
@@ -720,18 +720,18 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
             zmax=self.large_radius + epsilon,
             boundary_type='vacuum'
         )
-        vacuum_region = -vacuum_box & ~self.fuel_cell.region & ~nrv_outer_region
+        vacuum_region = -vacuum_box & ~self.fuel_cell.region & ~niv_outer_region
         
         # Redefine outer region
-        self.outer_region |= nrv_outer_region
+        self.outer_region |= niv_outer_region
         
         # Cells
-        nrv_wall_cell = openmc.Cell(
-            name='nrv_wall_cell',
-            region=nrv_wall_region,
-            fill=self.nrv_wall_material,
+        niv_wall_cell = openmc.Cell(
+            name='niv_wall_cell',
+            region=niv_wall_region,
+            fill=self.niv_wall_material,
         )
-        self.add_cell(nrv_wall_cell)
+        self.add_cell(niv_wall_cell)
         
         vacuum_cell = openmc.Cell(
             name='vacuum_cell',
@@ -740,8 +740,8 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         )
         self.add_cell(vacuum_cell)
         
-        # Add back surface of NRV to tally, use nrv_wall_cell for partial current tally
-        self.tally_partial_current_surfaces = (outer_top_plane, nrv_wall_cell)
+        # Add back surface of NIV to tally, use niv_wall_cell for partial current tally
+        self.tally_partial_current_surfaces = (outer_top_plane, niv_wall_cell)
                 
 class DualSourceUniverse(openmc.Universe):
     def __init__(

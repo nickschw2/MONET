@@ -23,15 +23,15 @@ if __name__ == "__main__":
     #     # 'hohlraum_wall_thickness': 0.03
     # }
     geometry_kwargs = {
-        'nrv_fill_thickness': [5.0, 2.3],
-        'nrv_fill_material': ['ch2', 'flibe'],
+        'niv_fill_thickness': [5.0, 2.3],
+        'niv_fill_material': ['ch2', 'flibe'],
         'tally_nuclides': 'Li6',
         'tally_reactions': '(n,t)',
         'no_shielding': False
     }
     
     model = sim.setup_simulation(
-        geometry_type='nrv',
+        geometry_type='niv',
         convergence_ratio=5.0,#{'primary': 20.0, 'secondary': 1.0},
         source_kwargs=source_kwargs,
         geometry_kwargs=geometry_kwargs,
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     )
     
     print("Running simulation...")
-    run_dir = sim.run_simulation(model=model, run_name='nrv', reset=False)
+    run_dir = sim.run_simulation(model=model, run_name='niv', reset=False)
     print(f"Simulation completed. Results in: {run_dir}")
     
     # Process results
