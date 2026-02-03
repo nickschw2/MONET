@@ -1,6 +1,5 @@
 import openmc
-from typing import Optional, Dict
-import copy
+from typing import Optional, Dict, Union
 
 class NIFMaterial(openmc.Material):
     def __init__(
@@ -9,7 +8,7 @@ class NIFMaterial(openmc.Material):
         color: str,
         density: float,
         elements: list[str],
-        fractions: list[float],
+        fractions: list[Union[float, Dict]],
         fraction_type: str = 'ao',
         **kwargs
     ):
@@ -41,11 +40,23 @@ class NIFMaterial(openmc.Material):
         self.set_density("g/cm3", density)
         for element, fraction in zip(elements, fractions):
             if any(char.isdigit() for char in element):
+                if isinstance(fraction, dict):
+                    raise ValueError("Nuclide fractions must be provided as floats.")
                 # It's a nuclide
                 self.add_nuclide(element, fraction, fraction_type)
             else:
                 # It's an element
-                self.add_element(element, fraction, fraction_type)
+                if isinstance(fraction, dict):
+                    self.add_element(
+                        element,
+                        fraction['percent'],
+                        percent_type=fraction_type,
+                        enrichment=fraction['enrichment'],
+                        enrichment_target=fraction['enrichment_target'],
+                        enrichment_type=fraction_type
+                    )
+                else:
+                    self.add_element(element, fraction, fraction_type)
                 
 class FuelMaterial(NIFMaterial):
     def __init__(
@@ -113,7 +124,8 @@ class FuelMaterial(NIFMaterial):
             color='tomato',
             density=fuel_density,
             elements=elements,
-            fractions=fractions
+            fractions=fractions,
+            **kwargs
         )
 
 class NIFMaterials(openmc.Materials):
@@ -199,6 +211,13 @@ class NIFMaterials(openmc.Materials):
             fractions=[1], 
             density=2.7,
         ),
+        'steel': NIFMaterial(
+            name='steel', 
+            color='gray',
+            elements=['Fe', 'C', 'Cr', 'Ni', 'Mn', 'Si'],
+            fractions=[0.70, 0.002, 0.18, 0.10, 0.02, 0.01], 
+            density=7.85,
+        ),
         "water": NIFMaterial(
             name='water', 
             color='royalblue',
@@ -231,8 +250,28 @@ class NIFMaterials(openmc.Materials):
             name='flibe', 
             color='orange',
             elements=['Li', 'Be', 'F'],
-            fractions=[2, 1, 4], 
+            fractions=[
+                {'percent': 2.0,
+                'enrichment': 60.0,
+                'enrichment_target': 'Li6'},
+                1,
+                4
+            ], 
             density=1.94,
+        ),
+        "lithium_hydride": NIFMaterial(
+            name='lithium_hydride', 
+            color='lightgreen',
+            elements=['Li', 'H'],
+            fractions=[1, 1], 
+            density=0.793,
+        ),
+        "zirconium_hydride": NIFMaterial(
+            name='zirconium_hydride', 
+            color='pink',
+            elements=['Zr', 'H'],
+            fractions=[1, 1.6], 
+            density=5.6,
         ),
     }
 
@@ -244,27 +283,32 @@ class NIFMaterials(openmc.Materials):
             
     def create_dt_fuel(
         self,
+        name: str = 'dt_fuel',
         **kwargs
     ) -> FuelMaterial:
         """
         Create DT fuel with optional trace doping and other dopants
-        
+
         Parameters:
         -----------
+        name: str
+            Name for the fuel material in the library (default: 'dt_fuel').
+            Use different names to create distinct fuel variants (e.g., 'dt_fuel_primary', 'dt_fuel_secondary').
         **kwargs: dict
             Keyword arguments for FuelMaterial
-        
+
         Returns:
         --------
         FuelMaterial
             DT fuel material
-        """        
+        """
         fuel = FuelMaterial(**kwargs)
-        
-        # Add to library     
-        self.library['dt_fuel'] = fuel
+        fuel.name = name
+
+        # Add to library
+        self.library[name] = fuel
         self.append(fuel)
-        
+
         return fuel
     
     def __getitem__(self, name: Optional[str]) -> Optional[openmc.Material]:

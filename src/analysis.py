@@ -6,12 +6,20 @@ from pathlib import Path
 import numpy as np
 import json
 from typing import Optional, List, Tuple, Union, Dict, Literal
+from dataclasses import dataclass
+from labellines import labelLines
 
 from .materials import NIFMaterials
 
 # Set plotting params
 plt.rcParams['font.size'] = 20
 plt.rcParams['lines.linewidth'] = 3
+
+@dataclass
+class NuclideData:
+    """Data structure for nuclide tally information"""
+    tally: pd.DataFrame
+    reaction: str
 
 class DataProcessor:
     """Class to process OpenMC simulation results"""
@@ -48,16 +56,10 @@ class DataProcessor:
         else:
             raise FileNotFoundError(f"No model.xml file found in {simulation_dir}")
         
-    def get_fuel_cell(self) -> openmc.Cell:
-        """Get fuel cell object from model"""
+    def get_tally_cell(self, id: int) -> openmc.Cell:
+        """Get cell object from model"""
         if self.geometry:
-            fuel_cells = self.geometry.get_cells_by_name('fuel')
-            if len(fuel_cells) > 1:
-                # If it's a dual source universe, get secondary fuel
-                return self.geometry.get_cells_by_name('fuel_secondary')[0]
-            else:
-                # Else get the primary fuel
-                return fuel_cells[0]
+            return self.geometry.get_all_cells()[id]
         else:
             raise RuntimeError("Geometry not found")
     
@@ -95,33 +97,48 @@ class DataProcessor:
         self.mesh_tally_df = mesh_tally_df
         self.mesh = mesh_filter.mesh
         
-    def extract_fuel_data(self) -> pd.DataFrame:
-        tally = self.sp.get_tally(name='fuel_tally')
-        fuel_tally_df = tally.get_pandas_dataframe()
+    def extract_cell_data(self) -> Dict[str, pd.DataFrame]:
+        # Initialize cell tally dataframe
+        tally = self.sp.get_tally(name='cell_tally')
+        cell_tallies_df = tally.get_pandas_dataframe()
         
-        # Get fuel cell and its volume
-        fuel_cell = self.get_fuel_cell()
-        fuel_tally_df = fuel_tally_df[fuel_tally_df['cell'] == fuel_cell.id]
+        # Loop through all bins
+        cell_tallies: Dict[str, pd.DataFrame] = {}
+        for cell_id in tally.find_filter(openmc.CellFilter).bins:
+            # Get cell and volume
+            cell = self.get_tally_cell(cell_id)
+            if cell is None:
+                volume = 1.0  # cm^3
+            else:
+                volume = cell.volume if cell.volume else 1.0
+            
+            # Extract data for this cell
+            cell_tally = cell_tallies_df[cell_tallies_df['cell'] == cell_id].copy()
+            # Normalize by volume
+            cell_tally['mean'] /= volume
+            cell_tally['std. dev.'] /= volume
+            # Store in dict
+            cell_tallies[cell.name] = cell_tally
         
-        # Check to make sure fuel cell was found
-        if len(fuel_tally_df) == 0:
-            raise Exception("No data found for fuel cell filter")
-        
-        if fuel_cell is None:
-            volume = 1.0  # cm^3
-        else:
-            volume = fuel_cell.volume if fuel_cell.volume else 1.0
-        
-        # Normalize by volume
-        fuel_tally_df['mean'] /= volume
-        fuel_tally_df['std. dev.'] /= volume
-        
-        return fuel_tally_df
+        return cell_tallies
     
-    def extract_trace_data(self) -> pd.DataFrame:
-        tally = self.sp.get_tally(name='trace_tally')
-        trace_tally_df = tally.get_pandas_dataframe()
-        return trace_tally_df
+    def extract_nuclide_data(self) -> Dict[str, NuclideData]:
+        """Extract nuclide data"""
+        nuclide_tallies: Dict[str, NuclideData] = {}
+        for nuclide, reaction in zip(
+            self.simulation_params['track_nuclides'],
+            self.simulation_params['reactions']
+        ):
+            tally = self.sp.get_tally(name=f'nuclide_tally_{nuclide}_{reaction}')
+            nuclide_tally_df = tally.get_pandas_dataframe()
+            nuclide_tallies[nuclide] = NuclideData(tally=nuclide_tally_df, reaction=reaction)
+        return nuclide_tallies
+    
+    def extract_surface_data(self) -> pd.DataFrame:
+        """Extract surface tally data"""
+        # TODO: There's only one surface for now, but expand later
+        tally = self.sp.get_tally(scores=['current'])
+        return tally.get_pandas_dataframe()
     
     def get_aggregate(self, tally_df: pd.DataFrame, groupby: List[str]) -> pd.DataFrame:
         """Aggregate tally data by specified columns"""
@@ -139,46 +156,53 @@ class DataProcessor:
     
     def calculate_moderation_efficiency(self, cutoff: float = 0.1) -> Dict[str,  Union[float, Dict[float, Tuple[float, float]]]]:
         """Calculate neutron moderation efficiency"""
-        # Get fuel tally
-        fuel_tally_df = self.extract_fuel_data()
+        # Get cell tally
+        cell_tallies = self.extract_cell_data()
         
-        # Get aggregated fuel tally by energy
-        fuel_tally_agg = self.get_aggregate(fuel_tally_df, ['energy low [eV]'])
-        fuel_tally_mean = fuel_tally_agg['mean']
-        fuel_tally_std = fuel_tally_agg['std. dev.']
-        
-        # Moderation efficiency defined as fraction of neutrons below energy threshold
-        low_energy_threshold = np.array(self.simulation_params['low_energy_threshold']) * 1e6 # eV
-        
-        # Separate moderated and high-energy fluxes
-        total_mean = fuel_tally_mean.sum()
-        total_std = np.sqrt((fuel_tally_std**2).sum())
-        
-        # Initialize dictionariess
-        efficiency_dict = {}
-        moderated_flux_dict = {}
-        for energy in low_energy_threshold:
-            # Find the efficiency of moderating below a given energy
-            moderated_idx = fuel_tally_agg['energy low [eV]'] <= energy
-            moderated_mean = fuel_tally_mean[moderated_idx].sum()
-            moderated_std = np.sqrt((fuel_tally_std[moderated_idx]**2).sum())
+        # Initialize results dictionaries
+        moderation_efficiency = {}
+        moderated_flux = {}
+        total_flux = {}
+        for cell_name, cell_tally_df in cell_tallies.items():
             
-            efficiency = moderated_mean / total_mean if total_mean > 0 else 0
-            efficiency_std = efficiency * np.sqrt(
-                (moderated_std / moderated_mean)**2 + (total_std / total_mean)**2
-            ) if moderated_mean > 0 and total_mean > 0 else 0
+            # Get aggregated cell tally by energy
+            cell_tally_agg = self.get_aggregate(cell_tally_df, ['energy low [eV]'])
+            cell_tally_mean = cell_tally_agg['mean']
+            cell_tally_std = cell_tally_agg['std. dev.']
             
-            efficiency_dict[energy] = (efficiency, efficiency_std)
-            moderated_flux_dict[energy] = (moderated_mean, moderated_std)
+            # Moderation efficiency defined as fraction of neutrons below energy threshold
+            low_energy_threshold = np.array(self.simulation_params['low_energy_threshold']) * 1e6 # eV
             
-            # Print results
-            print(f'Fraction below {int(energy)} eV: {efficiency} +/- {efficiency_std}')
-            print(f"Target reached: {'YES' if efficiency > cutoff else 'NO'}")
+            # Separate moderated and high-energy fluxes
+            total_mean = cell_tally_mean.sum()
+            total_std = np.sqrt((cell_tally_std**2).sum())
+            total_flux[cell_name] = (total_mean, total_std)
             
+            # Initialize dicts for this cell
+            moderation_efficiency[cell_name] = {}
+            moderated_flux[cell_name] = {}
+            for energy in low_energy_threshold:
+                # Find the efficiency of moderating below a given energy
+                moderated_idx = cell_tally_agg['energy low [eV]'] <= energy
+                moderated_mean = cell_tally_mean[moderated_idx].sum()
+                moderated_std = np.sqrt((cell_tally_std[moderated_idx]**2).sum())
+                
+                efficiency = moderated_mean / total_mean if total_mean > 0 else 0
+                efficiency_std = efficiency * np.sqrt(
+                    (moderated_std / moderated_mean)**2 + (total_std / total_mean)**2
+                ) if moderated_mean > 0 and total_mean > 0 else 0
+                
+                moderation_efficiency[cell_name][energy] = (efficiency, efficiency_std)
+                moderated_flux[cell_name][energy] = (moderated_mean, moderated_std)
+                
+                # Print results
+                print(f'Fraction below {int(energy)} eV: {efficiency} +/- {efficiency_std}')
+                print(f"Target reached: {'YES' if efficiency > cutoff else 'NO'}")
+                
         return {
-            'moderation_efficiency': efficiency_dict,
-            'moderated_flux': moderated_flux_dict,
-            'total_flux': total_mean
+            'moderation_efficiency': moderation_efficiency,
+            'moderated_flux': moderated_flux,
+            'total_flux': total_flux
         }
 
 class ResultsPlotter:
@@ -227,8 +251,8 @@ class ResultsPlotter:
         if not hasattr(self.data_processor, 'mesh'):
             self.data_processor.extract_mesh_data()
         
-        fig, ax = plt.subplots(figsize=(14, 10), layout='constrained')
-        corners = ['top_left', 'top_right', 'bottom_left', 'bottom_right']
+        fig, ax = plt.subplots(figsize=(10, 9), layout='constrained')
+        corners = ['top_left', 'top_right', 'bottom_right', 'bottom_left']
         cmaps = ['magma', 'plasma', 'viridis', 'hot']
         for i, (score, cmap) in enumerate(zip(scores, cmaps)):
             self._plot_mesh_quadrant(fig, ax, score, corner=corners[i], cmap=cmap)
@@ -280,7 +304,7 @@ class ResultsPlotter:
         if score not in possible_scores:
             raise ValueError(f'{score} not in available scores: {possible_scores}')
         
-        score_df = mesh_df[mesh_df['score'] == score]
+        score_df = mesh_df[mesh_df['score'] == score].copy()
         
         if mesh.dimension:
             dim_x, dim_z = mesh.dimension[0], mesh.dimension[2]
@@ -311,7 +335,9 @@ class ResultsPlotter:
         score_df_agg = self.data_processor.get_aggregate(quadrant_df, ['x', 'y', 'z'])
         # Reshape into quadrant size
         score_mean = score_df_agg['mean'].to_numpy().reshape((dim_x//2, dim_z//2), order='F')
-        
+        # Replace zeros with NaN to avoid log10(0) warning and hide empty cells
+        score_mean = np.where(score_mean > 0, score_mean, np.nan)
+
         # Create plot for specified reaction
         im = ax.imshow(
             np.log10(score_mean),
@@ -342,7 +368,9 @@ class ResultsPlotter:
         self,
         tally_df: pd.DataFrame,
         variable: str,
-        name: str
+        id: str,
+        name: str,
+        reaction: Optional[str] = None,
     ):
         # Establish the correct units
         if variable == 'energy':
@@ -393,35 +421,33 @@ class ResultsPlotter:
             step='pre'
         )
         
-        # Calculate cumulative sum and normalize to [0, 1]
+        # Calculate cumulative sum
         cumsum = np.nancumsum(mean)
-        cumsum_normalized = cumsum / cumsum[-1]
         
         # Calculate uncertainty propagation for cumulative sum
         cumsum_var = np.nancumsum(std**2)  # Sum of variances
         cumsum_std = np.sqrt(cumsum_var)   # Standard deviation
-        cumsum_std_normalized = cumsum_std / cumsum[-1]  # Normalize the same way
 
         # Create secondary y-axis for CDF
         ax2 = ax.twinx()
-        ax2.step(x, cumsum_normalized, color='black', where='pre', 
-                label='CDF', linestyle='-', linewidth=2)
+        ax2.step(x, cumsum, color='black', where='pre', 
+                label='Cumulative', linestyle='-', linewidth=2)
 
         # Plot uncertainty as shaded region
-        positive = cumsum_normalized - cumsum_std_normalized > 0
+        positive = cumsum - cumsum_std > 0
         ax2.fill_between(
             x,
-            cumsum_normalized - cumsum_std_normalized,
-            cumsum_normalized + cumsum_std_normalized,
+            cumsum - cumsum_std,
+            cumsum + cumsum_std,
             alpha=0.2,
             color='black',
             where=positive,
             step='pre'
         )
 
-        ax2.set_ylabel('Cumulative Fraction', color='black')
+        ax2.set_ylabel('Cumulative Tally', color='black')
         ax2.tick_params(axis='y', labelcolor='black')
-        ax2.set_ylim(0, 1)
+        ax2.set_ylim(bottom=0)
         
         # Add features to plots depending on whether it's a time or energy spectrum
         low_energy_threshold = self.data_processor.simulation_params['low_energy_threshold']
@@ -441,7 +467,8 @@ class ResultsPlotter:
                 x = threshold_tally_aggregate[f'{variable} low [{unit}]'] * multiplier
                 
                 # Create plots
-                ax.step(x, mean, color=color, where='pre', label='Total')
+                energy_label = f'<{int(energy)} MeV' if energy >= 1 else f'<{int(energy*1e3)} keV'
+                ax.step(x, mean, color=color, where='pre', label=energy_label)
                 
                 # Plot std. dev. as shaded area
                 positive = mean - std > 0
@@ -465,19 +492,41 @@ class ResultsPlotter:
         
         # Changes scale and sets axis limits
         self.setup_log_plot_axes(ax)
+        if variable == 'time':
+            ax.set_xlim(left=-0.25, right=10)
+            # Add label lines
+            labelLines(ax.get_lines(), align=True, fontsize=16, xvals=[0.55, 9.2, 1.7, 0.5, 5])
+            labelLines(ax2.get_lines(), align=True, fontsize=16, xvals=[5])
+            
         ax.set_xlabel(f'{variable.capitalize()} ({prefix}{unit})')
         # TODO: change ylabel based on tally type
-        if name == 'fuel':
+        if name == 'cell':
             ylabel = '#/cm$^2$-source'
-        elif name == 'trace':
-            ylabel = '(n,gamma)/source'
+        elif name == 'nuclide':
+            if reaction:
+                if 'gamma' in reaction:
+                    reaction = '(n,$\gamma$)'
+                ylabel = f'{reaction}/source'
+            else:
+                ylabel = '(n,$\gamma$)/source'
         else:
-            raise ValueError('Name must be either "fuel" or "source"')
+            raise ValueError('Name must be either "cell" or "nuclide"')
         ax.set_ylabel(ylabel)
+        ax.grid(which='major', lw=0.5)
         
         # Save figure
-        fig.savefig(f'{self.save_dir}/{name}_{variable}.png', dpi=300, bbox_inches='tight')
+        fig.savefig(f'{self.save_dir}/{id}_{name}_{variable}.png', dpi=300, bbox_inches='tight')
         plt.close(fig)
+        
+        # Print out expected values
+        # Convert spectrum to pdf
+        pdf = tally_aggregate.copy()
+        pdf['mean'] /= pdf['mean'].sum()
+        pdf['std. dev.'] /= pdf['mean'].sum()
+        expected_value = (x * pdf['mean']).sum()
+        second_moment = (x**2 * pdf['mean']).sum()
+        expected_std = np.sqrt(second_moment - expected_value**2)
+        print(f'Expected {variable} for {name} {id}: {expected_value} +/- {expected_std} {prefix}{unit}')
         
     @staticmethod
     def setup_log_plot_axes(ax: Axes):
@@ -507,28 +556,37 @@ class ResultsPlotter:
                 if x_max is None or x_max_new > x_max:
                     x_max = x_max_new
         
-        if x_min or x_max:     
-            ax.set_xlim(left=x_min - 0.05 * (x_max - x_min), right=x_max + 0.05 * (x_max - x_min))
-        if y_min:
+        if x_min is not None and x_max is not None:
+            # Use multiplicative padding for log scale, additive for linear
+            if ax.get_xscale() == 'log':
+                padding_factor = 1.1
+                ax.set_xlim(left=x_min / padding_factor, right=x_max * padding_factor)
+            else:
+                x_range = x_max - x_min
+                ax.set_xlim(left=x_min - 0.05 * x_range, right=x_max + 0.05 * x_range)
+        if y_min is not None:
             ax.set_ylim(bottom=0.5 * y_min)
         
     def plot_all(self):
         """Create all standard plots"""
-        fuel_tally_df = self.data_processor.extract_fuel_data()
-        trace_tally_df = self.data_processor.extract_trace_data()
+        cell_tallies = self.data_processor.extract_cell_data()
+        nuclide_tallies = self.data_processor.extract_nuclide_data()
         
         # Plot energy spectra
-        self.plot_spectrum(fuel_tally_df, 'energy', 'fuel')
-        self.plot_spectrum(trace_tally_df, 'energy', 'trace')
-        
+        for cell_name, cell_tally_df in cell_tallies.items():
+            self.plot_spectrum(cell_tally_df, 'energy', cell_name, 'cell')
+        for nuclide, nuclide_data in nuclide_tallies.items():
+            self.plot_spectrum(nuclide_data.tally, 'energy', nuclide, 'nuclide', reaction=nuclide_data.reaction)
         # Plot time spectra
-        self.plot_spectrum(fuel_tally_df, 'time', 'fuel')
-        self.plot_spectrum(trace_tally_df, 'time', 'trace')
-        
+        for cell_name, cell_tally_df in cell_tallies.items():
+            self.plot_spectrum(cell_tally_df, 'time', cell_name, 'cell')
+        for nuclide, nuclide_data in nuclide_tallies.items():
+            self.plot_spectrum(nuclide_data.tally, 'time', nuclide, 'nuclide', reaction=nuclide_data.reaction)
         # Plot 2D spatial maps
         self.plot_mesh('flux')
         self.plot_mesh('scatter')
         self.plot_mesh('(n,2n)')
         self.plot_mesh('(n,3n)')
         self.plot_mesh('(n,gamma)')
+        self.plot_mesh('(n,t)')
         self.plot_combined_mesh(['flux', 'scatter', '(n,2n)'])

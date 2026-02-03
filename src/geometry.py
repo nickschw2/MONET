@@ -1,11 +1,29 @@
 import openmc
 from openmc.model import RectangularParallelepiped as BOX
 from openmc.model import RightCircularCylinder as RCC
-from openmc.model import ConicalFrustum
 import numpy as np
 from typing import Optional, Literal, Tuple, Union, Sequence
 from abc import abstractmethod
-from .materials import NIFMaterials
+from .materials import NIFMaterials, FuelMaterial
+
+# Helper function for getting materials from universes
+def get_materials(universe: openmc.Universe) -> openmc.Materials:
+        """
+        Recursively get materials
+        """
+        materials = openmc.Materials()
+        # Get all cells in this universe
+        for cell in universe.cells.values():
+            if cell.fill:
+                # If the cell is filled with a universe, recurse
+                if isinstance(cell.fill, openmc.Universe):
+                    for material in get_materials(cell.fill):
+                        materials.append(material)
+                else:
+                    # Skip over materials that have already been added
+                    if cell.fill not in materials:
+                        materials.append(cell.fill)
+        return materials
 
 class BaseImplosionUniverse(openmc.Universe):
     """Base class for spherical implosion geometry"""
@@ -16,9 +34,9 @@ class BaseImplosionUniverse(openmc.Universe):
         convergence_ratio: float = 1.0,
         fuel_radius_original: float = 0.1,
         ablator_thickness_original: float = 0.01,
-        fuel_material: str = 'dt_fuel',
+        fuel_material: FuelMaterial = FuelMaterial(),
         ablator_material: str = 'ch2',
-        tag: Literal['primary', 'secondary'] = 'primary',
+        tag: Optional[Literal['primary', 'secondary']] = None,
         **kwargs):
         """Initialize NIF Universe
         
@@ -32,8 +50,8 @@ class BaseImplosionUniverse(openmc.Universe):
             Original fuel radius in cm
         ablator_thickness_original : float
             Original ablator thickness in cm
-        fuel_material : str
-            Fuel material
+        fuel_material : FuelMaterial
+            Fuel material, defaults to standard DT fuel with trace nuclide
         ablator_material : str
             Ablator material
         tag : str, optional
@@ -46,12 +64,11 @@ class BaseImplosionUniverse(openmc.Universe):
         self.convergence_ratio = convergence_ratio
         self.fuel_radius_original = fuel_radius_original
         self.ablator_thickness_original = ablator_thickness_original
-        self.fuel_material = self.materials[fuel_material]
+        self.fuel_material = fuel_material
         self.ablator_material = self.materials[ablator_material]
         self.tag = tag
         
         self._create_base_geometry()
-        self.add_tag_to_cells(self.tag)
       
     def _create_base_geometry(self) -> None:
         # Compress fuel and ablator
@@ -136,7 +153,7 @@ class BaseImplosionUniverse(openmc.Universe):
             if isinstance(cell.fill, BaseImplosionUniverse):
                 cell.fill.remove_vacuum_boundaries()
     
-    def add_tag_to_cells(self, tag: str):
+    def add_tag_to_cells(self, tag: Optional[str]=None):
         """
         Add a tag to all cells in this universe and its nested universes.
         
@@ -145,6 +162,9 @@ class BaseImplosionUniverse(openmc.Universe):
         tag : str
             Tag to add to all cells
         """
+        # Do nothing if tag is None
+        if tag is None:
+            return
         for cell in self.cells.values():
             # Add suffix to cell name
             if cell.name:
@@ -153,24 +173,6 @@ class BaseImplosionUniverse(openmc.Universe):
             # If cell is filled with a universe, recurse
             if isinstance(cell.fill, BaseImplosionUniverse):
                 cell.fill.add_tag_to_cells(tag)
-                
-    def get_materials(self) -> openmc.Materials:
-        """
-        Recursively get materials
-        """
-        materials = openmc.Materials()
-        # Get all cells in this universe
-        for cell in self.cells.values():
-            if cell.fill:
-                # If the cell is filled with a universe, recurse
-                if isinstance(cell.fill, BaseImplosionUniverse):
-                    for material in cell.fill.get_materials():
-                        materials.append(material)
-                else:
-                    # Skip over materials that have already been added
-                    if cell.fill not in materials:
-                        materials.append(cell.fill)
-        return materials
     
     def get_fuel_params(self) -> Tuple[float, openmc.Cell]:
         """
@@ -249,7 +251,6 @@ class IndirectDriveUniverse(BaseImplosionUniverse):
         self.remove_vacuum_boundaries()
         
         self._create_geometry()
-        self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
         """Create the standard NIF geometry"""       
@@ -388,7 +389,6 @@ class DoubleShellUniverse(BaseImplosionUniverse):
         self.foam_material = self.materials[foam_material]
         
         self._create_geometry()
-        self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
         """Create the double-shell geometry"""
@@ -473,6 +473,9 @@ class CoronalUniverse(BaseImplosionUniverse):
         """
         super().__init__(**kwargs)
         
+        if self.convergence_ratio != 1.0:
+            raise ValueError(f'Convergence ratio of coronal target cannot be {self.convergence_ratio}, as it is always 1 because they are not compressed.')
+        
         self.ice_thickness_original = ice_thickness_original or 0.0
         self.ice_material = self.materials[ice_material]
         self.hole_radius_original = hole_radius_original
@@ -482,7 +485,6 @@ class CoronalUniverse(BaseImplosionUniverse):
             raise ValueError("Hole radius must be less than capsule radius")
         
         self._create_geometry()
-        self.add_tag_to_cells(self.tag)
     
     def _create_geometry(self) -> None:
         """Create the coronal source geometry"""
@@ -536,6 +538,9 @@ class CoronalUniverse(BaseImplosionUniverse):
             # Add constraint to outer region
             self.outer_region &= -hole2_plane
             
+            # Subtract second hole volume from fuel cell
+            self.fuel_cell.volume -= cap_volume
+            
 class NuclearReactionVesselUniverse(BaseImplosionUniverse):
     def __init__(
         self,
@@ -544,8 +549,12 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
         large_diameter: float = 4.0,
         wall_thickness: float = 0.1,
         distance_from_source: float = 9.0,
-        nrv_material: str = 'aluminum',
-        nrv_fill_material: Optional[str] = None,
+        nrv_wall_material: str = 'aluminum',
+        nrv_fill_thickness: Optional[Union[float, Sequence[float]]] = None,
+        nrv_fill_material: Optional[Union[str, Sequence[str]]] = None,
+        tally_nuclides: Optional[Union[str, Sequence[str]]] = None,
+        tally_reactions: Optional[Union[str, Sequence[str]]] = None,
+        no_shielding: bool = False,
         **kwargs):
         """
         Initialize nuclear reaction vessel geometry. Details of NRV can be found here https://doi.org/10.1016/j.nima.2018.01.072
@@ -562,84 +571,204 @@ class NuclearReactionVesselUniverse(BaseImplosionUniverse):
             Wall thickness in cm
         distance_from_source : float
             Distance from source in cm
-        nrv_material : str
+        nrv_wall_material : str
             Name of nrv material
+        nrv_fill_thickness : float, optional
+            Thickness(es) of nrv fill, should sum to `cone_length - 2 * wall_thickness` if provided
         nrv_fill_material : str, optional
-            Name of nrv fill material
+            Name of nrv fill material(s)
+        tally_nuclides : str, optional
+            Nuclide to tally
+        tally_reactions : str, optional
+            Reaction(s) to tally, corresponding in order to `tally_nuclides`
+        no_shielding : bool
+            If True, set fill to None for any material that does not contain a tally nuclide
         **kwargs
             Additional parameters for BaseImplosionUniverse
         """
         super().__init__(**kwargs)
         
         self.cone_length = cone_length
-        self.small_diameter = small_diameter
-        self.large_diameter = large_diameter
+        self.small_radius = small_diameter / 2
+        self.large_radius = large_diameter / 2
         self.wall_thickness = wall_thickness
         self.distance_from_source = distance_from_source
-        self.nrv_material = self.materials[nrv_material]
-        self.nrv_fill_material = self.materials[nrv_fill_material]
+        self.nrv_wall_material = self.materials[nrv_wall_material]
+        
+        # Find solid angle of cone for later use
+        self.cos_cone_angle = (self.distance_from_source + self.cone_length) / np.sqrt((self.distance_from_source + self.cone_length)**2 + self.large_radius**2)
+        self.solid_angle = 2 * np.pi * (1 - self.cos_cone_angle)
+        
+        # Handle if nrv fill is iterable vs not
+        if isinstance(nrv_fill_thickness, float) and isinstance(nrv_fill_material, str):
+            self.nrv_fill_thickness = [nrv_fill_thickness]
+            self.nrv_fill_material = [self.materials[nrv_fill_material]]
+        elif isinstance(nrv_fill_thickness, Sequence) and isinstance(nrv_fill_material, Sequence) and not isinstance(nrv_fill_material, str):
+            if len(nrv_fill_thickness) != len(nrv_fill_thickness):
+                raise ValueError("Fill thicknesses and materials must be the same length")
+            self.nrv_fill_thickness = nrv_fill_thickness
+            self.nrv_fill_material = [self.materials[mat] for mat in nrv_fill_material]
+        elif nrv_fill_thickness is None and nrv_fill_material is None:
+            self.nrv_fill_thickness = nrv_fill_thickness
+            self.nrv_fill_material = nrv_fill_material
+        else:
+            raise ValueError("Fill thickness and material must be the same type")
+        
+        # Handle if nuclide and reactions are iterable vs not
+        if isinstance(tally_nuclides, str) and isinstance(tally_reactions, str):
+            self.tally_nuclides = [tally_nuclides]
+            self.tally_reactions = [tally_reactions]
+        elif isinstance(tally_nuclides, Sequence) and isinstance(tally_reactions, Sequence) and not isinstance(tally_nuclides, str):
+            if len(tally_nuclides) != len(tally_reactions):
+                raise ValueError("Tally nuclides and reactions must be the same length")
+            self.tally_nuclides = tally_nuclides
+            self.tally_reactions = tally_reactions
+        elif tally_nuclides is None and tally_reactions is None:
+            self.tally_nuclides = tally_nuclides
+            self.tally_reactions = tally_reactions
+        else:
+            raise ValueError("Tally nuclide and reactions must be the same type")
+
+        self.no_shielding = no_shielding
+        
+        # If total thickness is not equal to cone length - 2 * wall_thickness, raise error
+        if self.nrv_fill_thickness:
+            total_fill_thickness = np.sum(self.nrv_fill_thickness)
+            expected_thickness = self.cone_length - 2 * self.wall_thickness
+            if total_fill_thickness != expected_thickness:
+                raise ValueError(f"Total fill thickness {total_fill_thickness} does not equal expected thickness {expected_thickness}")
         
         self.remove_vacuum_boundaries()
         self._create_geometry()
-        self.add_tag_to_cells(self.tag)
         
     def _create_geometry(self) -> None:
-        # Create surfaces
-        nrv_outer_cone = ConicalFrustum(
-            center_base=(self.distance_from_source, 0, 0),
-            axis=(self.cone_length, 0, 0),
-            r1=self.small_diameter / 2,
-            r2=self.large_diameter / 2,
-        )
-        nrv_inner_cone = ConicalFrustum(
-            center_base=(self.distance_from_source + self.wall_thickness, 0, 0),
-            axis=(self.cone_length - 2 * self.wall_thickness, 0, 0),
-            r1=self.small_diameter / 2 - self.wall_thickness,
-            r2=self.large_diameter / 2 - self.wall_thickness,
-        )
+        # Create conical surfaces
+        slope = (self.large_radius - self.small_radius) / self.cone_length
+        apex_outer = self.distance_from_source - self.small_radius / slope
+        apex_inner = apex_outer + self.wall_thickness / (slope / np.sqrt(1 + slope**2))  # Trig to find inner apex location
+        nrv_outer_cone = openmc.XCone(x0=apex_outer, r2=slope**2)
+        nrv_inner_cone = openmc.XCone(x0=apex_inner, r2=slope**2)
+        outer_bottom_plane = openmc.XPlane(x0=self.distance_from_source)
+        outer_top_plane = openmc.XPlane(x0=self.distance_from_source + self.cone_length)
         
-        # Regions
-        nrv_wall_region = -nrv_inner_cone & +nrv_outer_cone
-        nrv_fill_region = -nrv_inner_cone
+        # Create nrv_fill stack
+        # Create planes
+        self.nrv_fill_planes = [
+            openmc.XPlane(x0=self.distance_from_source + self.wall_thickness), # start at beginning of fill region
+            openmc.XPlane(x0=self.distance_from_source + self.cone_length - self.wall_thickness) # end at end of fill region
+        ]
+        
+        # Need to also define perpendicular planes because bounding_box cannot be defined automatically for cone surfaces
+        outer_ymin_plane = openmc.YPlane(y0=-self.large_radius)
+        outer_ymax_plane = openmc.YPlane(y0=self.large_radius)
+        outer_zmin_plane = openmc.ZPlane(z0=-self.large_radius)
+        outer_zmax_plane = openmc.ZPlane(z0=self.large_radius)
+        perpendicular_boundary_region = +outer_ymin_plane & -outer_ymax_plane & +outer_zmin_plane & -outer_zmax_plane
+        
+        total_nrv_fill_region = -nrv_inner_cone & +self.nrv_fill_planes[0] & -self.nrv_fill_planes[-1] & perpendicular_boundary_region
+        
+        # Add nrv_fill planes
+        if self.nrv_fill_material and self.nrv_fill_thickness:
+            for i in range(len(self.nrv_fill_thickness) - 1):
+                self.nrv_fill_planes.insert(
+                    i + 1,
+                    openmc.XPlane(self.distance_from_source + self.wall_thickness + np.sum(self.nrv_fill_thickness[:i+1]))
+                )
+                
+            # Create nrv_fill cells
+            self.tally_cells = []
+            for i, material in enumerate(self.nrv_fill_material):
+                nrv_fill_region = -nrv_inner_cone & +self.nrv_fill_planes[i] & -self.nrv_fill_planes[i+1] & perpendicular_boundary_region
+
+                # Check if this material contains a tally nuclide
+                contains_tally_nuclide = self.tally_nuclides and material and any(nuclide in material.get_nuclides() for nuclide in self.tally_nuclides)
+
+                # If no_shielding is True, only fill with material if it contains a tally nuclide
+                if self.no_shielding and not contains_tally_nuclide:
+                    fill_material = None
+                else:
+                    fill_material = material
+
+                nrv_fill_cell = openmc.Cell(
+                    name=f'nrv_fill_cell_{i}',
+                    region=nrv_fill_region,
+                    fill=fill_material
+                )
+                self.add_cell(nrv_fill_cell)
+                
+                # Set volume of cell
+                r1 = slope * (self.nrv_fill_planes[i].x0 - apex_inner)
+                r2 = slope * (self.nrv_fill_planes[i+1].x0 - apex_inner)
+                nrv_fill_cell.volume = (1/3) * np.pi * self.nrv_fill_thickness[i] * (r1**2 + r1 * r2 + r2**2)
+
+                # Store the cell for tallying if it contains a tally nuclide
+                if contains_tally_nuclide:
+                    self.tally_cells.append(nrv_fill_cell)
+        
+        # Create wall region
+        nrv_outer_region = -nrv_outer_cone & +outer_bottom_plane & -outer_top_plane & perpendicular_boundary_region
+        nrv_wall_region = nrv_outer_region & ~total_nrv_fill_region
+        
+        # Extend vacuum boundary slightly
+        epsilon = 1e-3
+        vacuum_box = BOX(
+            xmin=-(self.fuel_radius + self.ablator_thickness + epsilon),
+            xmax=self.distance_from_source + self.cone_length + epsilon,
+            ymin=-(self.large_radius + epsilon),
+            ymax=self.large_radius + epsilon,
+            zmin=-(self.large_radius + epsilon),
+            zmax=self.large_radius + epsilon,
+            boundary_type='vacuum'
+        )
+        vacuum_region = -vacuum_box & ~self.fuel_cell.region & ~nrv_outer_region
+        
+        # Redefine outer region
+        self.outer_region |= nrv_outer_region
         
         # Cells
         nrv_wall_cell = openmc.Cell(
-            name='nrv_wall',
+            name='nrv_wall_cell',
             region=nrv_wall_region,
-            fill=self.nrv_material,
+            fill=self.nrv_wall_material,
         )
         self.add_cell(nrv_wall_cell)
         
-        if self.nrv_fill_material:
-            nrv_fill_cell = openmc.Cell(
-                name='nrv_fill',
-                region=nrv_fill_region,
-                fill=self.nrv_fill_material,
-            )
-            self.add_cell(nrv_fill_cell)
+        vacuum_cell = openmc.Cell(
+            name='vacuum_cell',
+            region=vacuum_region,
+            fill=None,
+        )
+        self.add_cell(vacuum_cell)
+        
+        # Add back surface of NRV to tally, use nrv_wall_cell for partial current tally
+        self.tally_partial_current_surfaces = (outer_top_plane, nrv_wall_cell)
                 
-class DualSourceUniverse(BaseImplosionUniverse):
+class DualSourceUniverse(openmc.Universe):
     def __init__(
         self,
         primary_geom: BaseImplosionUniverse,
         secondary_geom: BaseImplosionUniverse,
+        materials: Optional[NIFMaterials] = None,
         center_distance: float = 0.5,
         moderator_radius: float = 1.0,
         moderator_thickness: Union[float, Sequence[float]] = 0.1,
         moderator_material: Union[str, Sequence[str]] = 'ch2',
         moderator_distance: Optional[float] = None,
         secondary_orientation: Literal['parallel', 'perpendicular'] = 'parallel',
+        no_shielding: bool = False,
         **kwargs
     ):
         """
         Initialize dual source geometry. Geometry is centered on the moderator in z.
-        
+
         Parameters:
         -----------
         primary_geom : BaseImplosionUniverse
             Primary source geometry
         secondary_geom : BaseImplosionUniverse
             Secondary source geometry
+        materials : NIFMaterials, optional
+            Material database
         center_distance : float
             Distance between source centers in cm
         moderator_radius : float
@@ -652,15 +781,19 @@ class DualSourceUniverse(BaseImplosionUniverse):
             Distance between moderator center and primary source center in cm
         secondary_orientation : str, optional
             Orientation of secondary source, one of ['parallel', 'perpendicular']
+        no_shielding : bool
+            If True, set all moderator materials to None (vacuum)
         """
         
         super().__init__(**kwargs)
         self.primary_geom = primary_geom
         self.secondary_geom = secondary_geom
+        self.materials = materials or NIFMaterials()
         self.center_distance = center_distance
         self.moderator_radius = moderator_radius
         self.moderator_distance = moderator_distance or center_distance / 2 # default to midway between sources
         self.secondary_orientation = secondary_orientation
+        self.no_shielding = no_shielding
         
         # Handle if moderator is iterable vs not
         if isinstance(moderator_thickness, float) and isinstance(moderator_material, str):
@@ -673,7 +806,7 @@ class DualSourceUniverse(BaseImplosionUniverse):
             self.moderator_material = [self.materials[mat] for mat in moderator_material]
         else:
             raise ValueError("Moderator thickness and material must be the same type")
-        
+
         if self.moderator_distance > center_distance:
             raise ValueError("Moderator distance must be less than center distance")
         
@@ -771,7 +904,7 @@ class DualSourceUniverse(BaseImplosionUniverse):
             moderator_cell = openmc.Cell(
                 name=f'moderator_cell_{i}',
                 region=moderator_region,
-                fill=material
+                fill=None if self.no_shielding else material
             )
             self.add_cell(moderator_cell)
             
@@ -872,24 +1005,9 @@ class DualFilledHohlraum(DualSourceUniverse):
         self.primary_coronal = primary_coronal
         self.secondary_coronal = secondary_coronal
         self.hohlraum_inner_radius = hohlraum_inner_radius
-        self.hohlraum_material = self.materials[hohlraum_material]
         self.hohlraum_wall_thickness = hohlraum_wall_thickness
         self.layered_moderator_primary_gap = layered_moderator_primary_gap
         self.hohlraum_lining_thickness = hohlraum_lining_thickness
-        self.hohlraum_lining_material = self.materials[hohlraum_lining_material]
-        
-        # Handle if layered moderator is iterable vs not
-        if layered_moderator_material and layered_moderator_thickness:
-            if isinstance(layered_moderator_thickness, float) and isinstance(layered_moderator_material, str):
-                self.layered_moderator_thickness = [layered_moderator_thickness]
-                self.layered_moderator_material = [self.materials[layered_moderator_material]]
-            elif isinstance(layered_moderator_thickness, Sequence) and isinstance(layered_moderator_material, Sequence) and not isinstance(layered_moderator_material, str):
-                if len(layered_moderator_thickness) != len(layered_moderator_material):
-                    raise ValueError("Moderator thickness and material must be the same length")
-                self.layered_moderator_thickness = layered_moderator_thickness
-                self.layered_moderator_material = [self.materials[mat] for mat in layered_moderator_material]
-            else:
-                raise ValueError("Moderator thickness and material must be the same type")
         
         # Calculate center distance based on source size and gap
         self.primary_radius = primary_coronal.capsule_radius
@@ -910,13 +1028,30 @@ class DualFilledHohlraum(DualSourceUniverse):
             moderator_thickness=self.fill_length,
             moderator_radius=hohlraum_inner_radius,
             moderator_material=fill_material,
-            convergence_ratio=1.0, # No compression
             **kwargs
         )
         
-        # Remove vacuum boundary conditions from parent class
-        self.remove_vacuum_boundaries()
+        # Assign materials
+        self.hohlraum_material = self.materials[hohlraum_material]
+        self.hohlraum_lining_material = self.materials[hohlraum_lining_material]
         
+        # Handle if layered moderator is iterable vs not
+        if layered_moderator_material and layered_moderator_thickness:
+            if isinstance(layered_moderator_thickness, float) and isinstance(layered_moderator_material, str):
+                self.layered_moderator_thickness = [layered_moderator_thickness]
+                self.layered_moderator_material = [self.materials[layered_moderator_material]]
+            elif isinstance(layered_moderator_thickness, Sequence) and isinstance(layered_moderator_material, Sequence) and not isinstance(layered_moderator_material, str):
+                if len(layered_moderator_thickness) != len(layered_moderator_material):
+                    raise ValueError("Moderator thickness and material must be the same length")
+                self.layered_moderator_thickness = layered_moderator_thickness
+                self.layered_moderator_material = [self.materials[mat] for mat in layered_moderator_material]
+            else:
+                raise ValueError("Moderator thickness and material must be the same type")
+        
+        # Remove vacuum boundary conditions from parent classes
+        self.primary_coronal.remove_vacuum_boundaries()
+        self.secondary_coronal.remove_vacuum_boundaries()
+
         self._create_dual_filled_hohlraum_geometry()
     
     def _create_dual_filled_hohlraum_geometry(self):
@@ -962,7 +1097,8 @@ class DualFilledHohlraum(DualSourceUniverse):
         # Add lining
         if self.hohlraum_lining_material and self.hohlraum_lining_thickness:
             # Remove vacuum boundary from hohlraum outer surface
-            self.remove_vacuum_boundaries()
+            self.primary_coronal.remove_vacuum_boundaries()
+            self.secondary_coronal.remove_vacuum_boundaries()
             
             hohlraum_lining_outer_cylinder = openmc.ZCylinder(r=self.hohlraum_inner_radius + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness)
             hohlraum_lining_bottom = openmc.ZPlane(z0=-(self.fill_length/2 + self.hohlraum_wall_thickness + self.hohlraum_lining_thickness))
@@ -1040,7 +1176,7 @@ class DualFilledHohlraum(DualSourceUniverse):
         )
         self.add_cell(vacuum_cell)
     
-class DualHohlraumCoronal(DualSourceUniverse):
+class DualIndirectCoronal(DualSourceUniverse):
     """
     Specialized dual source universe for a standard hohlraum implosion as the primary source
     and a inverted coronal as the secondary source.
@@ -1104,11 +1240,12 @@ class DualHohlraumCoronal(DualSourceUniverse):
         self.reflector_material = self.materials[reflector_material]
         
         # Remove vacuum boundary conditions from parent class
-        self.remove_vacuum_boundaries()
+        self.primary_hohlraum.remove_vacuum_boundaries()
+        self.secondary_coronal.remove_vacuum_boundaries()
+
+        self._create_dual_indirect_coronal_geometry()
         
-        self._create_dual_hohlraum_coronal_geometry()
-        
-    def _create_dual_hohlraum_coronal_geometry(self):
+    def _create_dual_indirect_coronal_geometry(self):
         # The parent __init__ already handled, need to remove vacuum cell
         for cell in self.cells.values():
             if cell.name == 'vacuum_cell':

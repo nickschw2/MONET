@@ -1,4 +1,5 @@
 import openmc
+from openmc import stats
 import os
 import json
 from typing import Optional, Dict, Any, Union, Literal
@@ -59,7 +60,7 @@ class NIFSimulation:
     
     def setup_simulation(
         self,
-        geometry_type: Literal['standard', 'double_shell', 'coronal', 'dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal'] = 'standard',
+        geometry_type: Literal['indirect', 'double_shell', 'coronal', 'nrv', 'dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal'] = 'indirect',
         # Simulation parameters
         batches: int = 100,
         particles_per_batch: int = int(1e5),
@@ -77,7 +78,7 @@ class NIFSimulation:
         Parameters:
         -----------
         geometry_type : str
-            Geometry type, one of ['standard', 'double_shell', 'coronal', 'dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal']
+            Geometry type, one of ['indirect', 'double_shell', 'coronal', 'nrv', 'dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal']
         batches : int
             Number of batches
         particles_per_batch : int
@@ -106,27 +107,49 @@ class NIFSimulation:
         """
         # Create materials
         materials = NIFMaterials()
-        # Create DT fuel
-        fuel = materials.create_dt_fuel(
-            trace_nuclide=trace_nuclide,
-            fuel_fraction=fuel_fraction,
-            **fuel_kwargs or {}
-        )
-        
+
         # Create settings
         settings = openmc.Settings(**settings_kwargs or {})
         settings.run_mode = "fixed source"
         settings.batches = batches
         settings.particles = particles_per_batch
         settings.output = {'tallies': True}
-        
-        # Modify convergence ratio
-        if isinstance(convergence_ratio, float):
-            convergence_ratio = {'primary': convergence_ratio}
                 
         # Create geometry
-        if geometry_type == 'dual_source' or geometry_type == 'dual_filled_hohlraum' or geometry_type == 'dual_hohlraum_coronal':
-            universe = self._setup_dual_source_geometry(geometry_type, materials, convergence_ratio, **geometry_kwargs or {})
+        if geometry_type in ('dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal'):
+            if not isinstance(convergence_ratio, dict):
+                raise ValueError("For dual source geometries, convergence_ratio must be a dict with 'primary' and 'secondary' keys")
+            
+            # Primary fuel without trace nuclide
+            primary_fuel = materials.create_dt_fuel(
+                name='dt_fuel_primary',
+                trace_nuclide=trace_nuclide,
+                trace_concentration=0.0,  # No trace in primary
+                fuel_fraction=fuel_fraction,
+                **fuel_kwargs or {}
+            )
+            # Secondary fuel with trace nuclide
+            secondary_fuel = materials.create_dt_fuel(
+                name='dt_fuel_secondary',
+                trace_nuclide=trace_nuclide,
+                fuel_fraction=fuel_fraction,
+                **fuel_kwargs or {}
+            )
+            fuel = secondary_fuel  # Use secondary fuel for setup_params tracking
+            
+            # Pass geometry kwargs to primary and secondary geometries
+            primary_geometry_kwargs = {'fuel_material': primary_fuel}
+            secondary_geometry_kwargs = {'fuel_material': secondary_fuel}
+            
+            # Set up dual source geometry
+            universe = self._setup_dual_source_geometry(
+                geometry_type,
+                materials,
+                convergence_ratio,
+                primary_geometry_kwargs=primary_geometry_kwargs,
+                secondary_geometry_kwargs=secondary_geometry_kwargs,
+                **geometry_kwargs or {}
+            )
             primary_fuel_radius, primary_fuel_cell = universe.primary_geom.get_fuel_params()
             secondary_fuel_radius, secondary_fuel_cell = universe.secondary_geom.get_fuel_params()
             primary_fuel_radius_compressed = primary_fuel_radius / universe.primary_geom.convergence_ratio
@@ -134,7 +157,6 @@ class NIFSimulation:
             
             # TODO: assuming the two sources have the same strength, change this to be configurable
             # TODO: assume the two sources have the same pulse width and start time, change this to be configurable
-            # TODO: assuming that the fuel is the same in both sources, change this to be configurable
             # Create source
             primary_origin = tuple(universe.axis_vector * universe.primary_translation)
             primary_source = SphericalSource(
@@ -161,12 +183,36 @@ class NIFSimulation:
             # Set source in settings
             settings.source = [primary_source]
             # settings.source = [primary_source, secondary_source]
+            
         else:
-            universe = self._setup_geometry(geometry_type, materials, convergence_ratio, **geometry_kwargs or {})
-
+            if not isinstance(convergence_ratio, float):
+                raise ValueError("For single source geometries, convergence_ratio must be a float")
+            # Create fuel material
+            fuel = materials.create_dt_fuel(
+                trace_nuclide=trace_nuclide,
+                fuel_fraction=fuel_fraction,
+                **fuel_kwargs or {}
+            )
+            geometry_kwargs = geometry_kwargs or {}
+            geometry_kwargs['fuel_material'] = fuel
+            
+            # Set up single source geometry
+            universe = self._setup_geometry(geometry_type, materials, convergence_ratio, **geometry_kwargs)
+            
             # Calculate fuel radius after compression
             fuel_radius, fuel_cell = universe.get_fuel_params()
             fuel_radius_compressed = fuel_radius / universe.convergence_ratio
+            
+            # If using NRV, set azimuthal angle for source
+            if isinstance(universe, NuclearReactionVesselUniverse):
+                source_kwargs = source_kwargs or {}
+                source_kwargs['angle'] = stats.PolarAzimuthal(
+                    mu=stats.Uniform(a=0, b=universe.cos_cone_angle),
+                    phi=stats.Uniform(a=0, b=2*np.pi),
+                    reference_vwu=(1.0, 0, 0)
+                )
+                # Need to set source strength to account for solid angle subtended by NRV
+                source_kwargs['strength'] = universe.solid_angle / (4 * np.pi)
             
             # Create source
             source = SphericalSource(
@@ -185,9 +231,25 @@ class NIFSimulation:
         
         # Create tallies
         tallies = NIFTallies(geometry=geometry)
+        # Determine cell for tallying
+        if isinstance(universe, NuclearReactionVesselUniverse):
+            cells = universe.tally_cells
+            partial_current_surfaces = [universe.tally_partial_current_surfaces]
+            track_nuclides = universe.tally_nuclides
+            reactions = universe.tally_reactions
+            
+        else:
+            # Default to fuel cell and n,gamma reaction
+            cells = None
+            partial_current_surfaces = None
+            track_nuclides = [trace_nuclide]
+            reactions = ['(n,gamma)']
+        
         tallies.create_tallies(
-            trace_nuclide=trace_nuclide,
-            pulse_fwhm=pulse_fwhm,
+            cells=cells,
+            partial_current_surfaces=partial_current_surfaces,
+            track_nuclides=track_nuclides,
+            reactions=reactions,
             **tally_kwargs or {}
         )
         
@@ -196,7 +258,7 @@ class NIFSimulation:
             geometry=geometry,
             settings=settings,
             tallies=tallies,
-            materials=universe.get_materials()
+            materials=get_materials(universe)
         )
         
         # Store parameters and universe for later use
@@ -205,7 +267,8 @@ class NIFSimulation:
             'convergence_ratio': convergence_ratio,
             'fuel_fraction': fuel_fraction,
             'fuel_pressure': fuel.fuel_pressure,
-            'trace_nuclide': trace_nuclide,
+            'track_nuclides': track_nuclides,
+            'reactions': reactions,
             'trace_concentration': fuel.trace_concentration,
             'dopant_nuclide': fuel.dopant_nuclide,
             'dopant_concentration': fuel.dopant_concentration,
@@ -230,7 +293,7 @@ class NIFSimulation:
     
     def _setup_geometry(
         self,
-        geometry_type: Literal['standard', 'double_shell', 'coronal'],
+        geometry_type: Literal['indirect', 'double_shell', 'coronal', 'nrv'],
         materials: NIFMaterials,
         convergence_ratio: float,
         tag: Literal['primary', 'secondary'] = 'primary',
@@ -241,7 +304,7 @@ class NIFSimulation:
         
         Parameters:
         geometry_type : str
-            Geometry type, one of ['standard', 'double_shell', 'coronal']
+            Geometry type, one of ['indirect', 'double_shell', 'coronal', 'nrv']
         materials : NIFMaterials
             Material database
         convergence_ratio : float
@@ -256,7 +319,7 @@ class NIFSimulation:
             Configured universe
         """
         
-        if geometry_type == 'standard':
+        if geometry_type == 'indirect':
             return IndirectDriveUniverse(
                 materials=materials,
                 convergence_ratio=convergence_ratio,
@@ -273,9 +336,6 @@ class NIFSimulation:
             )
             
         elif geometry_type == 'coronal':
-            if convergence_ratio != 1.0:
-                raise ValueError(f'Convergence ratio of coronal target cannot be {convergence_ratio}, as it is always 1 because they are not compressed.')
-            
             return CoronalUniverse(
                 materials=materials,
                 convergence_ratio=convergence_ratio,
@@ -283,16 +343,24 @@ class NIFSimulation:
                 **kwargs or {}
             )
             
+        elif geometry_type == 'nrv':
+            return NuclearReactionVesselUniverse(
+                materials=materials,
+                convergence_ratio=convergence_ratio,
+                tag=tag,
+                **kwargs or {}
+            )
+            
         else:
-            raise ValueError(f"Invalid geometry type: {geometry_type}")
+            raise ValueError(f"Invalid geometry type: {geometry_type}. Options are ['indirect', 'double_shell', 'coronal', 'nrv'].")
         
     def _setup_dual_source_geometry(
         self,
-        type: Literal['dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal'],
+        type: Literal['dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal'],
         materials: NIFMaterials,
         convergence_ratio: Dict[Literal['primary', 'secondary'], float],
-        primary_geometry_type: Literal['standard', 'double_shell', 'coronal'],
-        secondary_geometry_type: Literal['standard', 'double_shell', 'coronal'],
+        primary_geometry_type: Literal['indirect', 'double_shell', 'coronal'],
+        secondary_geometry_type: Literal['indirect', 'double_shell', 'coronal'],
         primary_geometry_kwargs: Optional[Dict[str, Any]] = None,
         secondary_geometry_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
@@ -302,13 +370,13 @@ class NIFSimulation:
         
         Parameters:
         type : str
-            Geometry type, one of ['dual_source', 'dual_filled_hohlraum', 'dual_hohlraum_coronal']
+            Geometry type, one of ['dual_source', 'dual_filled_hohlraum', 'dual_indirect_coronal']
         materials : NIFMaterials
             Material database
         primary_geometry_type : str
-            Primary geometry type, one of ['standard', 'double_shell', 'coronal']
+            Primary geometry type, one of ['indirect', 'double_shell', 'coronal']
         secondary_geometry_type : str
-            Secondary geometry type, one of ['standard', 'double_shell', 'coronal']
+            Secondary geometry type, one of ['indirect', 'double_shell', 'coronal']
         primary_geometry_kwargs : dict, optional
             Additional parameters for primary BaseImplosionUniverse
         secondary_geometry_kwargs : dict, optional
@@ -325,15 +393,15 @@ class NIFSimulation:
             materials=materials,
             convergence_ratio=convergence_ratio['primary'],
             tag='primary',
-            **(primary_geometry_kwargs or {})
+            **primary_geometry_kwargs or {}
         )
-        
+
         secondary_geom = self._setup_geometry(
             geometry_type=secondary_geometry_type,
             materials=materials,
             convergence_ratio=convergence_ratio['secondary'],
             tag='secondary',
-            **(secondary_geometry_kwargs or {})
+            **secondary_geometry_kwargs or {}
         )
         
         if type == 'dual_source':
@@ -353,11 +421,11 @@ class NIFSimulation:
                 materials=materials,
                 **kwargs or {}
             )
-        elif type == 'dual_hohlraum_coronal':
+        elif type == 'dual_indirect_coronal':
             if not isinstance(primary_geom, IndirectDriveUniverse) or not isinstance(secondary_geom, CoronalUniverse):
-                raise ValueError("Both primary and secondary geometries must be 'coronal' for 'dual_hohlraum_coronal' type")
+                raise ValueError("Both primary and secondary geometries must be 'coronal' for 'dual_indirect_coronal' type")
             
-            universe = DualHohlraumCoronal(
+            universe = DualIndirectCoronal(
                 primary_hohlraum=primary_geom,
                 secondary_coronal=secondary_geom,
                 materials=materials,
